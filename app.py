@@ -421,10 +421,19 @@ def calculate_quality(df):
 
 
 def rainfall_statistics(df):
-    rainfall = df["Rainfall (mm)"].dropna()
+    # Always force the rainfall series to numeric before calculating
+    # statistics. Some uploaded Excel files can otherwise leave a
+    # datetime/NaT value in this column, which makes std() fail.
+    rainfall = pd.to_numeric(
+        df["Rainfall (mm)"], errors="coerce"
+    ).dropna()
 
     if rainfall.empty:
         return None
+
+    std_value = rainfall.std()
+    if pd.isna(std_value):
+        std_value = 0.0
 
     return {
         "total": float(rainfall.sum()),
@@ -434,7 +443,7 @@ def rainfall_statistics(df):
         "minimum": float(rainfall.min()),
         "non_zero": int((rainfall > 0).sum()),
         "zero": int((rainfall == 0).sum()),
-        "std": float(rainfall.std())
+        "std": float(std_value)
     }
 
 
@@ -476,6 +485,28 @@ def rainfall_events(df, dry_period_hours, interval_minutes):
     positive["Previous Rainfall Gap"] = positive["Date/Time"].diff()
     dry_period = pd.Timedelta(hours=float(dry_period_hours))
 
+    # Validate the detected interval before using it in Timedelta.
+    # This prevents malformed Excel/date metadata from producing an
+    # enormous or negative interval and crashing the event analysis.
+    try:
+        safe_interval = float(interval_minutes)
+    except (TypeError, ValueError):
+        safe_interval = np.nan
+
+    if (
+        not np.isfinite(safe_interval)
+        or safe_interval <= 0
+        or safe_interval > 10080
+    ):
+        gaps = positive["Date/Time"].diff().dropna()
+        gap_minutes = gaps.dt.total_seconds() / 60
+        gap_minutes = gap_minutes[gap_minutes > 0]
+
+        if not gap_minutes.empty:
+            safe_interval = float(gap_minutes.mode().iloc[0])
+        else:
+            safe_interval = 0.0
+
     positive["New Event"] = (
         positive["Previous Rainfall Gap"] > dry_period
     )
@@ -496,9 +527,9 @@ def rainfall_events(df, dry_period_hours, interval_minutes):
         maximum = float(group["Rainfall (mm)"].max())
         records = len(group)
 
-        if interval_minutes is not None and interval_minutes > 0:
-            duration = end - start + pd.Timedelta(minutes=float(interval_minutes))
-            intensity = maximum / (interval_minutes / 60)
+        if safe_interval > 0:
+            duration = end - start + pd.Timedelta(minutes=safe_interval)
+            intensity = maximum / (safe_interval / 60)
         else:
             duration = end - start
             intensity = np.nan
