@@ -10,10 +10,49 @@ from io import BytesIO
 # ============================================================
 
 st.set_page_config(
-    page_title="NIQKI Rainfall & Runoff Web Model",
+    page_title="NIQKI | Rainfall & Runoff Analysis",
     page_icon="💧",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
+
+# ============================================================
+# PROFESSIONAL UI THEME
+# ============================================================
+
+st.markdown("""
+<style>
+.block-container { max-width: 1400px; padding-top: 2.2rem; padding-bottom: 3rem; }
+section[data-testid="stSidebar"] { border-right: 1px solid rgba(100,116,139,.18); }
+section[data-testid="stSidebar"] > div { padding-top: 1.3rem; }
+h1 { font-size: 2.35rem !important; font-weight: 700 !important; letter-spacing: -.025em; }
+h2 { font-size: 1.55rem !important; font-weight: 650 !important; margin-top: 1.4rem !important; }
+h3 { font-size: 1.15rem !important; font-weight: 650 !important; }
+section[data-testid="stSidebar"] div[role="radiogroup"] { gap: .25rem; }
+section[data-testid="stSidebar"] div[role="radiogroup"] label { border-radius: 10px; padding: .42rem .65rem; transition: background .15s ease; }
+.niqki-brand { padding: .2rem 0 1.2rem 0; }
+.niqki-brand-mark { display:inline-flex; width:42px; height:42px; align-items:center; justify-content:center; border-radius:12px; background:rgba(14,116,144,.14); border:1px solid rgba(14,116,144,.25); font-size:1.35rem; margin-bottom:.65rem; }
+.niqki-brand-title { font-size:1.15rem; font-weight:750; line-height:1.15; }
+.niqki-brand-subtitle { color:#64748b; font-size:.78rem; margin-top:.25rem; }
+.niqki-hero { padding:2rem 2.1rem; border-radius:18px; border:1px solid rgba(100,116,139,.20); background:linear-gradient(135deg,rgba(14,116,144,.12),rgba(30,41,59,.04)); margin-bottom:1.5rem; }
+.niqki-eyebrow { text-transform:uppercase; letter-spacing:.13em; font-size:.72rem; font-weight:750; color:#0e7490; margin-bottom:.55rem; }
+.niqki-hero-title { font-size:clamp(2rem,4vw,3.2rem); line-height:1.05; font-weight:800; letter-spacing:-.04em; margin-bottom:.8rem; }
+.niqki-hero-text { max-width:820px; font-size:1.02rem; line-height:1.65; color:#64748b; }
+.niqki-card { min-height:165px; padding:1.25rem; border-radius:14px; border:1px solid rgba(100,116,139,.20); background:rgba(255,255,255,.025); }
+.niqki-card-icon { font-size:1.35rem; margin-bottom:.7rem; }
+.niqki-card-title { font-weight:700; font-size:1.02rem; margin-bottom:.4rem; }
+.niqki-card-text { color:#64748b; font-size:.9rem; line-height:1.5; }
+.niqki-step { text-align:center; padding:.8rem .35rem; }
+.niqki-step-number { width:34px; height:34px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; font-weight:750; background:rgba(14,116,144,.12); border:1px solid rgba(14,116,144,.25); margin-bottom:.45rem; }
+.niqki-step-label { font-size:.82rem; font-weight:650; }
+.niqki-step-note { color:#64748b; font-size:.72rem; margin-top:.2rem; }
+.niqki-footer { margin-top:2.5rem; padding-top:1rem; border-top:1px solid rgba(100,116,139,.18); color:#64748b; font-size:.76rem; }
+div[data-testid="stFileUploader"] { border-radius:14px; }
+.stButton > button, div[data-testid="stDownloadButton"] > button { border-radius:9px; font-weight:600; }
+div[data-testid="stDataFrame"] { border-radius:10px; overflow:hidden; }
+hr { margin:1.4rem 0 !important; border-color:rgba(100,116,139,.18) !important; }
+</style>
+""", unsafe_allow_html=True)
 
 # ============================================================
 # CONSTANTS
@@ -784,13 +823,19 @@ def format_event_table(df):
 
 
 # ============================================================
-# SIDEBAR
+# SIDEBAR / NAVIGATION
 # ============================================================
 
-st.sidebar.title("NIQKI Web Model")
+st.sidebar.markdown("""
+<div class="niqki-brand">
+    <div class="niqki-brand-mark">💧</div>
+    <div class="niqki-brand-title">NIQKI</div>
+    <div class="niqki-brand-subtitle">Rainfall &amp; Runoff Analysis</div>
+</div>
+""", unsafe_allow_html=True)
 
 page = st.sidebar.radio(
-    "Navigation",
+    "APPLICATION",
     [
         "Home",
         "Rainfall Data",
@@ -801,46 +846,80 @@ page = st.sidebar.radio(
     ]
 )
 
+st.sidebar.divider()
+st.sidebar.caption("Engineering analysis workflow")
+if st.session_state.get("rainfall_data") is not None:
+    st.sidebar.success("Rainfall dataset loaded")
+else:
+    st.sidebar.info("No rainfall dataset loaded")
+st.sidebar.caption("NIQKI Web Application · v1.0")
+
 # ============================================================
 # HOME
 # ============================================================
 
 if page == "Home":
-    st.title("NIQKI Rainfall & Runoff Web Model")
+    st.markdown("""
+    <div class="niqki-hero">
+        <div class="niqki-eyebrow">NIQKI · Engineering Analysis Platform</div>
+        <div class="niqki-hero-title">Rainfall &amp; Runoff Analysis</div>
+        <div class="niqki-hero-text">
+            A structured workflow for rainfall data preparation, quality control,
+            event analysis, simplified runoff and pollutant calculations, and
+            preparation of rainfall input files for EPA SWMM.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    st.subheader(
-        "Rainfall Data Processing, Event Analysis and Mathematical Modelling"
-    )
+    st.markdown("### What this application does")
+    c1, c2, c3 = st.columns(3, gap="medium")
+    cards = [
+        ("🌧️", "Rainfall data", "Import CSV, TXT, DAT or Excel rainfall datasets, detect columns and standardize the time series."),
+        ("📊", "Analysis & modelling", "Check data quality, identify rainfall events and calculate configurable runoff and pollutant indicators."),
+        ("🔗", "SWMM preparation", "Prepare an external rainfall file and the information required to connect the data to an EPA SWMM Rain Gage."),
+    ]
+    for col, (icon, title, text) in zip((c1, c2, c3), cards):
+        with col:
+            st.markdown(f"""
+            <div class="niqki-card">
+                <div class="niqki-card-icon">{icon}</div>
+                <div class="niqki-card-title">{title}</div>
+                <div class="niqki-card-text">{text}</div>
+            </div>
+            """, unsafe_allow_html=True)
 
-    st.write(
-        """
-        This web application provides a flexible workflow for importing
-        rainfall data from different sources, automatically identifying
-        relevant columns, standardizing the time series, checking data
-        quality, separating rainfall events and performing a configurable
-        rainfall-runoff-pollutant calculation.
-        """
-    )
+    st.markdown("### Workflow")
+    steps = [
+        ("01", "Upload", "Load rainfall data"),
+        ("02", "Validate", "Check structure & quality"),
+        ("03", "Analyze", "Statistics & events"),
+        ("04", "Model", "Runoff & pollutants"),
+        ("05", "Prepare", "Create SWMM input"),
+        ("06", "Export", "Download outputs"),
+    ]
+    cols = st.columns(6, gap="small")
+    for col, (num, label, note) in zip(cols, steps):
+        with col:
+            st.markdown(f"""
+            <div class="niqki-step">
+                <div class="niqki-step-number">{num}</div>
+                <div class="niqki-step-label">{label}</div>
+                <div class="niqki-step-note">{note}</div>
+            </div>
+            """, unsafe_allow_html=True)
 
-    st.divider()
+    st.markdown("### Get started")
+    if st.session_state.get("rainfall_data") is None:
+        st.info("Go to **Rainfall Data** in the navigation panel to upload your first rainfall dataset.")
+    else:
+        st.success("A rainfall dataset is currently loaded. Continue with the analysis or SWMM preparation pages.")
 
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        st.subheader("Rainfall")
-        st.write("Import and standardize rainfall datasets from different sources.")
-
-    with c2:
-        st.subheader("Runoff")
-        st.write("Calculate effective rainfall, runoff volume and flow.")
-
-    with c3:
-        st.subheader("Pollutants")
-        st.write("Estimate wash-off and pollutant load indicators.")
-
-    st.divider()
-
-    st.info("Start with Rainfall Data and upload your rainfall file.")
+    st.markdown("""
+    <div class="niqki-footer">
+        NIQKI Rainfall &amp; Runoff Analysis · Data preparation and engineering calculations ·
+        EPA SWMM simulation is performed externally.
+    </div>
+    """, unsafe_allow_html=True)
 
 
 # ============================================================
