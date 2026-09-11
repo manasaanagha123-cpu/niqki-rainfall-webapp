@@ -462,53 +462,118 @@ def default_dry_period(interval_minutes):
 # ============================================================
 
 def rainfall_events(df, dry_period_hours, interval_minutes):
+    """
+    Identify rainfall events using a dry-period separation threshold.
+
+    This function is deliberately defensive because uploaded rainfall files can
+    contain malformed interval metadata, NaT timestamps, mixed numeric/date
+    values, or very large/negative interval values. Event duration is therefore
+    calculated from ordinary numeric seconds rather than constructing a pandas
+    Timedelta from an unchecked value.
+    """
+    required = {"Date/Time", "Rainfall (mm)"}
+    if not required.issubset(df.columns):
+        return pd.DataFrame()
+
     data = df[["Date/Time", "Rainfall (mm)"]].copy()
 
+    # Robust timestamp conversion.
     data["Date/Time"] = pd.to_datetime(
         data["Date/Time"], errors="coerce"
     )
 
+    # Robust rainfall conversion.
     data["Rainfall (mm)"] = pd.to_numeric(
         data["Rainfall (mm)"], errors="coerce"
     )
 
     data = data.dropna(subset=["Date/Time"])
     data = data.sort_values("Date/Time")
+    data = data.drop_duplicates(subset=["Date/Time"], keep="first")
+    data = data.reset_index(drop=True)
 
-    positive = data[data["Rainfall (mm)"] > 0].copy()
+    # Only positive rainfall contributes to an event.
+    positive = data[
+        data["Rainfall (mm)"].notna()
+        & np.isfinite(data["Rainfall (mm)"])
+        & (data["Rainfall (mm)"] > 0)
+    ].copy()
 
     if positive.empty:
         return pd.DataFrame()
 
     positive = positive.reset_index(drop=True)
 
-    positive["Previous Rainfall Gap"] = positive["Date/Time"].diff()
-    dry_period = pd.Timedelta(hours=float(dry_period_hours))
-
-    # Validate the detected interval before using it in Timedelta.
-    # This prevents malformed Excel/date metadata from producing an
-    # enormous or negative interval and crashing the event analysis.
+    # Validate dry-period input independently.
     try:
-        safe_interval = float(interval_minutes)
+        dry_hours = float(dry_period_hours)
     except (TypeError, ValueError):
-        safe_interval = np.nan
+        dry_hours = 24.0
 
+    if not np.isfinite(dry_hours) or dry_hours < 0:
+        dry_hours = 24.0
+
+    # Keep the threshold within a practical range.
+    dry_hours = min(max(dry_hours, 0.0), 8760.0)
+
+    dry_seconds = dry_hours * 3600.0
+
+    positive["Previous Rainfall Gap"] = positive["Date/Time"].diff()
+
+    # ------------------------------------------------------------------
+    # Determine a safe interval.
+    #
+    # Prefer the observed timestamp spacing because it is the most reliable
+    # source for event-duration calculations. The supplied interval is used
+    # only when it is a finite, positive, physically reasonable number.
+    # ------------------------------------------------------------------
+    observed_minutes = np.nan
+
+    try:
+        gaps_seconds = (
+            positive["Date/Time"]
+            .diff()
+            .dt.total_seconds()
+            .dropna()
+        )
+        gaps_seconds = gaps_seconds[
+            np.isfinite(gaps_seconds) & (gaps_seconds > 0)
+        ]
+
+        if not gaps_seconds.empty:
+            # Median is robust to occasional missing records/large gaps.
+            observed_minutes = float(gaps_seconds.median() / 60.0)
+    except Exception:
+        observed_minutes = np.nan
+
+    try:
+        supplied_interval = float(interval_minutes)
+    except (TypeError, ValueError):
+        supplied_interval = np.nan
+
+    # Accept supplied interval only if it is sensible.
     if (
-        not np.isfinite(safe_interval)
-        or safe_interval <= 0
-        or safe_interval > 10080
+        np.isfinite(supplied_interval)
+        and supplied_interval > 0
+        and supplied_interval <= 10080
     ):
-        gaps = positive["Date/Time"].diff().dropna()
-        gap_minutes = gaps.dt.total_seconds() / 60
-        gap_minutes = gap_minutes[gap_minutes > 0]
+        safe_interval = supplied_interval
+    elif np.isfinite(observed_minutes) and 0 < observed_minutes <= 10080:
+        safe_interval = observed_minutes
+    else:
+        # Last-resort fallback for a valid rainfall table with unusable
+        # interval metadata.
+        safe_interval = 1440.0
 
-        if not gap_minutes.empty:
-            safe_interval = float(gap_minutes.mode().iloc[0])
-        else:
-            safe_interval = 0.0
+    # Final hard clamp. This guarantees that no enormous/negative value can
+    # reach the duration calculation.
+    safe_interval = float(np.clip(safe_interval, 0.001, 10080.0))
+    interval_seconds = safe_interval * 60.0
 
+    # Separate events after the selected dry period.
+    gap_seconds = positive["Previous Rainfall Gap"].dt.total_seconds()
     positive["New Event"] = (
-        positive["Previous Rainfall Gap"] > dry_period
+        gap_seconds > dry_seconds
     )
 
     positive.loc[0, "New Event"] = True
@@ -520,27 +585,44 @@ def rainfall_events(df, dry_period_hours, interval_minutes):
     event_rows = []
 
     for event_number, group in positive.groupby("Event"):
+        group = group.sort_values("Date/Time")
+
         start = group["Date/Time"].iloc[0]
         end = group["Date/Time"].iloc[-1]
 
         total = float(group["Rainfall (mm)"].sum())
         maximum = float(group["Rainfall (mm)"].max())
-        records = len(group)
+        records = int(len(group))
 
-        if safe_interval > 0:
-            duration = end - start + pd.Timedelta(minutes=safe_interval)
-            intensity = maximum / (safe_interval / 60)
-        else:
-            duration = end - start
-            intensity = np.nan
+        # Calculate duration using numeric seconds instead of
+        # pd.Timedelta(minutes=<possibly malformed value>).
+        try:
+            span_seconds = max(
+                0.0,
+                float((end - start).total_seconds())
+            )
+        except Exception:
+            span_seconds = 0.0
 
-        duration_hours = duration.total_seconds() / 3600
+        duration_hours = (
+            span_seconds + interval_seconds
+        ) / 3600.0
+
+        # Maximum interval rainfall converted to a rate.
+        intensity = (
+            maximum / (safe_interval / 60.0)
+            if safe_interval > 0
+            else np.nan
+        )
 
         previous_gap = group["Previous Rainfall Gap"].iloc[0]
         antecedent = (
             np.nan
             if pd.isna(previous_gap)
-            else previous_gap.total_seconds() / 3600
+            else max(
+                0.0,
+                float(previous_gap.total_seconds() / 3600.0)
+            )
         )
 
         event_rows.append({
