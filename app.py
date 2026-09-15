@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import csv
 import re
+import zipfile
 from io import BytesIO
 
 # ============================================================
@@ -90,7 +91,14 @@ defaults = {
     "model_parameters": None,
     "rainfall_events": None,
     "event_dry_period_hours": None,
-    "file_signature": None
+    "file_signature": None,
+    "traffic_data": None,
+    "traffic_file_signature": None,
+    "traffic_source_info": None,
+    "pollutant_data": None,
+    "traffic_parameters": None,
+    "pollutant_reference_data": None,
+    "pollutant_reference_source_info": None
 }
 
 for key, value in defaults.items():
@@ -118,6 +126,84 @@ def clean_column_names(df):
 def get_extension(filename):
     filename = str(filename).lower()
     return filename.rsplit(".", 1)[1] if "." in filename else ""
+
+
+SUPPORTED_DATA_EXTENSIONS = ["csv", "txt", "dat", "xlsx", "xls"]
+
+
+def get_zip_members(uploaded_file):
+    """Return supported data files contained in a ZIP archive."""
+    uploaded_file.seek(0)
+    raw = uploaded_file.read()
+
+    try:
+        archive = zipfile.ZipFile(BytesIO(raw))
+    except zipfile.BadZipFile as exc:
+        raise ValueError("The uploaded ZIP file is not a valid ZIP archive.") from exc
+
+    members = []
+    for info in archive.infolist():
+        if info.is_dir():
+            continue
+
+        # Ignore macOS metadata and hidden/system files.
+        name = info.filename.replace("\\", "/")
+        base_name = name.rsplit("/", 1)[-1]
+
+        if not base_name or base_name.startswith(".") or "__MACOSX" in name:
+            continue
+
+        extension = get_extension(base_name)
+        if extension in SUPPORTED_DATA_EXTENSIONS:
+            members.append(info.filename)
+
+    return members
+
+
+def extract_zip_member(uploaded_file, member_name):
+    """Extract one supported data file from an uploaded ZIP into memory."""
+    uploaded_file.seek(0)
+    raw = uploaded_file.read()
+
+    try:
+        archive = zipfile.ZipFile(BytesIO(raw))
+        info = archive.getinfo(member_name)
+        data = archive.read(info)
+    except (zipfile.BadZipFile, KeyError) as exc:
+        raise ValueError("Could not extract the selected file from the ZIP archive.") from exc
+
+    file_obj = BytesIO(data)
+    file_obj.name = member_name.rsplit("/", 1)[-1]
+    file_obj.size = len(data)
+    return file_obj
+
+
+def prepare_uploaded_data_file(uploaded_file, selection_key, label):
+    """
+    Convert either a normal data file or a ZIP archive into a file-like object
+    that the existing rainfall/traffic readers can process.
+    """
+    extension = get_extension(uploaded_file.name)
+
+    if extension != "zip":
+        return uploaded_file, extension, uploaded_file.name
+
+    members = get_zip_members(uploaded_file)
+
+    if not members:
+        raise ValueError(
+            f"No supported data files were found inside the ZIP archive. "
+            f"Supported types: {', '.join('.' + x for x in SUPPORTED_DATA_EXTENSIONS)}."
+        )
+
+    selected_member = st.selectbox(
+        f"Select the {label} file inside the ZIP archive",
+        members,
+        key=selection_key
+    )
+
+    extracted = extract_zip_member(uploaded_file, selected_member)
+    return extracted, get_extension(extracted.name), selected_member
 
 
 # ============================================================
@@ -822,6 +908,259 @@ def format_event_table(df):
     return output
 
 
+
+# ============================================================
+# TRAFFIC / POLLUTANT FUNCTIONS
+# ============================================================
+
+TRAFFIC_DATE_KEYWORDS = [
+    "date", "datum", "time", "zeit", "datetime", "date/time",
+    "datum/zeit", "timestamp", "zeitstempel", "zeitangabe"
+]
+
+TRAFFIC_COUNT_KEYWORDS = [
+    "traffic", "vehicle", "vehicles", "count", "volume",
+    "fahrzeug", "fahrzeuge", "verkehr", "verkehrsstärke",
+    "verkehrsmenge", "kfz", "vehicles/day", "veh/day"
+]
+
+
+def analyse_traffic_columns(df):
+    rows = []
+
+    for column in df.columns:
+        date_score = calculate_date_score(df[column])
+        numeric_score = calculate_numeric_score(df[column])
+        name = str(column).strip().lower()
+
+        date_keyword = sum(k in name for k in TRAFFIC_DATE_KEYWORDS)
+        traffic_keyword = sum(k in name for k in TRAFFIC_COUNT_KEYWORDS)
+
+        date_final = min(
+            1.0,
+            date_score * 0.75 + min(date_keyword, 2) * 0.125
+        )
+        traffic_final = min(
+            1.0,
+            numeric_score * 0.60 + min(traffic_keyword, 2) * 0.40
+        )
+
+        rows.append({
+            "Column": str(column),
+            "Date Score": round(date_final, 3),
+            "Traffic Score": round(traffic_final, 3),
+            "Numeric Score": round(numeric_score, 3)
+        })
+
+    return pd.DataFrame(rows)
+
+
+def suggest_traffic_date_column(analysis):
+    if analysis.empty:
+        return None
+    row = analysis.loc[analysis["Date Score"].idxmax()]
+    return row["Column"] if row["Date Score"] >= 0.40 else None
+
+
+def suggest_traffic_count_column(analysis):
+    if analysis.empty:
+        return None
+    row = analysis.loc[analysis["Traffic Score"].idxmax()]
+    return row["Column"] if row["Traffic Score"] >= 0.40 else None
+
+
+def read_swmm_external_inflow_file(uploaded_file):
+    """
+    Read the user's existing SWMM external pollutant inflow DAT file.
+
+    Expected data rows:
+        MM/DD/YYYY HH:MM MASS_KG_PER_DAY
+
+    Header/comment lines beginning with ';' are ignored.
+    The function intentionally returns pollutant mass data, not traffic counts.
+    """
+    uploaded_file.seek(0)
+    raw = uploaded_file.read()
+
+    if isinstance(raw, bytes):
+        text = None
+        for encoding in ["utf-8-sig", "utf-8", "cp1252", "latin1"]:
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is None:
+            raise ValueError("Could not decode the SWMM inflow DAT file.")
+    else:
+        text = str(raw)
+
+    lines = text.splitlines()
+
+    # Confirm that this really looks like an SWMM external inflow file.
+    header_text = "\n".join(lines[:20]).lower()
+    looks_like_inflow = (
+        "external inflow" in header_text
+        or "mass_inflow" in header_text
+        or "mass inflow" in header_text
+    )
+
+    if not looks_like_inflow:
+        raise ValueError(
+            "This file does not appear to be an SWMM external inflow file."
+        )
+
+    records = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        if not stripped or stripped.startswith(";"):
+            continue
+
+        # Ignore obvious header rows.
+        if re.search(r"[A-Za-z]", stripped):
+            continue
+
+        parts = re.split(r"\s+", stripped)
+
+        if len(parts) < 3:
+            continue
+
+        date_text = parts[0]
+        time_text = parts[1]
+        mass_text = parts[2]
+
+        dt = pd.to_datetime(
+            f"{date_text} {time_text}",
+            errors="coerce",
+            dayfirst=False
+        )
+
+        mass = pd.to_numeric(
+            str(mass_text).replace(",", "."),
+            errors="coerce"
+        )
+
+        if pd.isna(dt) or pd.isna(mass):
+            continue
+
+        records.append({
+            "Date/Time": dt,
+            "Mass Inflow (kg/day)": float(mass)
+        })
+
+    if not records:
+        raise ValueError(
+            "No valid SWMM external inflow records were found."
+        )
+
+    result = pd.DataFrame(records)
+    result = result.sort_values("Date/Time")
+    result = result.drop_duplicates(
+        subset=["Date/Time"],
+        keep="last"
+    ).reset_index(drop=True)
+
+    return result
+
+
+def read_traffic_file(uploaded_file, sheet_name=None):
+    extension = get_extension(uploaded_file.name)
+
+    if extension in ["xlsx", "xls"]:
+        sheets = get_excel_sheets(uploaded_file)
+        if sheet_name is None:
+            sheet_name = sheets[0]
+        df = read_excel_sheet(uploaded_file, sheet_name)
+        return df, f"Excel sheet: {sheet_name}"
+
+    df, encoding, separator, header_row = read_text_file(uploaded_file)
+    return df, f"{encoding}; separator={repr(separator)}; header row={header_row + 1}"
+
+
+def prepare_traffic_data(df, date_column, count_column):
+    data = pd.DataFrame()
+
+    data["Date/Time"] = parse_dates(df[date_column])
+    data["Traffic Count"] = convert_numeric(df[count_column])
+
+    data = data.dropna(subset=["Date/Time"])
+    data["Traffic Count"] = data["Traffic Count"].clip(lower=0)
+    data = data.sort_values("Date/Time")
+    data = data.drop_duplicates(subset=["Date/Time"], keep="last")
+    data = data.reset_index(drop=True)
+
+    return data
+
+
+def calculate_pollutant_loading(
+    traffic_data,
+    emission_factor_g_per_vehicle_day,
+    scale_factor=1.0
+):
+    data = traffic_data.copy()
+
+    data["Traffic Count"] = pd.to_numeric(
+        data["Traffic Count"], errors="coerce"
+    ).fillna(0).clip(lower=0)
+
+    # Transparent parameterized calculation:
+    # kg/day = vehicles/day × emission factor (g/vehicle/day)
+    #          × scale factor ÷ 1000.
+    data["Mass Inflow (kg/day)"] = (
+        data["Traffic Count"]
+        * float(emission_factor_g_per_vehicle_day)
+        * float(scale_factor)
+        / 1000.0
+    )
+
+    return data
+
+
+def generate_swmm_inflow_dat(
+    pollutant_data,
+    title="NIQKI SWMM External Inflow Time Series"
+):
+    lines = [
+        "; SWMM 5 External Inflow Time Series File",
+        f"; Source: {title}",
+        "; Date       Time    Mass_Inflow_(kg/day)"
+    ]
+
+    for _, row in pollutant_data.iterrows():
+        dt = pd.to_datetime(row["Date/Time"], errors="coerce")
+        mass = pd.to_numeric(
+            row["Mass Inflow (kg/day)"], errors="coerce"
+        )
+
+        if pd.isna(dt) or pd.isna(mass):
+            continue
+
+        lines.append(
+            f"{dt.strftime('%m/%d/%Y')} "
+            f"{dt.strftime('%H:%M')} "
+            f"{float(mass):.6f}"
+        )
+
+    return "\n".join(lines) + "\n"
+
+
+def traffic_summary(data):
+    if data is None or data.empty:
+        return {}
+
+    return {
+        "records": int(len(data)),
+        "total_vehicles": float(data["Traffic Count"].sum()),
+        "average": float(data["Traffic Count"].mean()),
+        "maximum": float(data["Traffic Count"].max()),
+        "minimum": float(data["Traffic Count"].min()),
+        "start": data["Date/Time"].min(),
+        "end": data["Date/Time"].max()
+    }
+
+
 # ============================================================
 # SIDEBAR / NAVIGATION
 # ============================================================
@@ -839,6 +1178,8 @@ page = st.sidebar.radio(
     [
         "Home",
         "Rainfall Data",
+        "Traffic Data",
+        "Pollutant Loading",
         "Model Parameters",
         "Simulation",
         "Results",
@@ -852,7 +1193,13 @@ if st.session_state.get("rainfall_data") is not None:
     st.sidebar.success("Rainfall dataset loaded")
 else:
     st.sidebar.info("No rainfall dataset loaded")
-st.sidebar.caption("NIQKI Web Application · v1.0")
+
+if st.session_state.get("traffic_data") is not None:
+    st.sidebar.success("Traffic dataset loaded")
+else:
+    st.sidebar.info("No traffic dataset loaded")
+
+st.sidebar.caption("NIQKI Web Application · v1.1")
 
 # ============================================================
 # HOME
@@ -875,8 +1222,8 @@ if page == "Home":
     c1, c2, c3 = st.columns(3, gap="medium")
     cards = [
         ("🌧️", "Rainfall data", "Import CSV, TXT, DAT or Excel rainfall datasets, detect columns and standardize the time series."),
-        ("📊", "Analysis & modelling", "Check data quality, identify rainfall events and calculate configurable runoff and pollutant indicators."),
-        ("🔗", "SWMM preparation", "Prepare an external rainfall file and the information required to connect the data to an EPA SWMM Rain Gage."),
+        ("🚗", "Traffic & pollutants", "Analyze traffic data and convert a user-defined, transparent emission factor into a pollutant mass time series."),
+        ("🔗", "SWMM preparation", "Prepare rainfall and pollutant external input files for connection to an EPA SWMM model."),
     ]
     for col, (icon, title, text) in zip((c1, c2, c3), cards):
         with col:
@@ -893,9 +1240,9 @@ if page == "Home":
         ("01", "Upload", "Load rainfall data"),
         ("02", "Validate", "Check structure & quality"),
         ("03", "Analyze", "Statistics & events"),
-        ("04", "Model", "Runoff & pollutants"),
-        ("05", "Prepare", "Create SWMM input"),
-        ("06", "Export", "Download outputs"),
+        ("04", "Traffic", "Analyze traffic data"),
+        ("05", "Pollutants", "Calculate mass loading"),
+        ("06", "SWMM", "Prepare external inputs"),
     ]
     cols = st.columns(6, gap="small")
     for col, (num, label, note) in zip(cols, steps):
@@ -942,14 +1289,32 @@ elif page == "Rainfall Data":
 
     uploaded_file = st.file_uploader(
         "Choose a rainfall file",
-        type=["csv", "txt", "dat", "xlsx", "xls"]
+        type=["csv", "txt", "dat", "xlsx", "xls", "zip"],
+        help=(
+            "You can upload a single rainfall file or a ZIP archive "
+            "containing CSV, TXT, DAT or Excel rainfall data."
+        )
     )
 
     if uploaded_file is None:
-        st.info("Please upload a rainfall file.")
+        st.info("Please upload a rainfall file or ZIP archive.")
 
     else:
-        signature = (uploaded_file.name, uploaded_file.size)
+        try:
+            selected_file, extension, source_name = prepare_uploaded_data_file(
+                uploaded_file,
+                "rainfall_zip_member",
+                "rainfall"
+            )
+        except Exception as exc:
+            st.error(f"Could not read the uploaded file/archive: {exc}")
+            st.stop()
+
+        signature = (
+            uploaded_file.name,
+            uploaded_file.size,
+            source_name
+        )
 
         if st.session_state.file_signature != signature:
             st.session_state.rainfall_data = None
@@ -959,17 +1324,17 @@ elif page == "Rainfall Data":
             st.session_state.file_signature = signature
 
         try:
-            extension = get_extension(uploaded_file.name)
+            extension = extension
 
             if extension in ["xlsx", "xls"]:
-                sheets = get_excel_sheets(uploaded_file)
+                sheets = get_excel_sheets(selected_file)
 
                 if len(sheets) > 1:
                     sheet_name = st.selectbox("Select worksheet", sheets)
                 else:
                     sheet_name = sheets[0]
 
-                df = read_excel_sheet(uploaded_file, sheet_name)
+                df = read_excel_sheet(selected_file, sheet_name)
                 encoding_used = "Excel"
                 separator_used = "Not applicable"
                 header_row = None
@@ -980,7 +1345,7 @@ elif page == "Rainfall Data":
                     encoding_used,
                     separator_used,
                     header_row
-                ) = read_text_file(uploaded_file)
+                ) = read_text_file(selected_file)
 
             st.subheader("2. File Information")
 
@@ -998,7 +1363,13 @@ elif page == "Rainfall Data":
             with c4:
                 st.metric(
                     "File Size",
-                    f"{uploaded_file.size / 1024:.1f} KB"
+                    f"{selected_file.size / 1024:.1f} KB"
+                )
+
+            if get_extension(uploaded_file.name) == "zip":
+                st.info(
+                    f"ZIP archive selected: **{uploaded_file.name}** → "
+                    f"using **{source_name}**"
                 )
 
             if extension not in ["xlsx", "xls"]:
@@ -1319,6 +1690,855 @@ elif page == "Rainfall Data":
             st.error("Could not process the uploaded rainfall file.")
             st.exception(error)
 
+
+# ============================================================
+# TRAFFIC DATA
+# ============================================================
+
+elif page == "Traffic Data":
+    st.title("Traffic Data")
+    st.write(
+        "Use this page for either a raw traffic dataset or an existing "
+        "SWMM external pollutant inflow file. These are different inputs "
+        "and are handled separately."
+    )
+
+    st.divider()
+
+    input_type = st.radio(
+        "Input type",
+        [
+            "Raw traffic dataset",
+            "Existing SWMM pollutant inflow DAT"
+        ],
+        horizontal=True,
+        key="traffic_input_type"
+    )
+
+    # --------------------------------------------------------
+    # EXISTING SWMM POLLUTANT INFLOW REFERENCE
+    # --------------------------------------------------------
+    if input_type == "Existing SWMM pollutant inflow DAT":
+        st.subheader("1. Upload Existing SWMM Pollutant Inflow")
+
+        st.info(
+            "This is NOT raw traffic data. Use this option for a file such "
+            "as twp_swmm_inflow.dat containing Date, Time and "
+            "Mass_Inflow_(kg/day). The file is treated as an existing "
+            "pollutant-loading reference and is not interpreted as vehicle "
+            "counts."
+        )
+
+        reference_file = st.file_uploader(
+            "Choose an existing SWMM pollutant inflow DAT file",
+            type=["dat", "txt", "zip"],
+            key="pollutant_reference_uploader",
+            help="A ZIP archive may contain the DAT/TXT pollutant inflow file."
+        )
+
+        if reference_file is not None:
+            signature = (
+                reference_file.name,
+                reference_file.size
+            )
+
+            try:
+                reference_input, reference_extension, reference_source = (
+                    prepare_uploaded_data_file(
+                        reference_file,
+                        "pollutant_zip_member",
+                        "SWMM pollutant inflow"
+                    )
+                )
+
+                reference = read_swmm_external_inflow_file(
+                    reference_input
+                )
+
+                st.session_state.pollutant_reference_data = reference
+                st.session_state.pollutant_reference_source_info = (
+                    reference_source
+                )
+
+                st.success(
+                    f"SWMM pollutant inflow file read successfully · "
+                    f"{len(reference):,} records"
+                )
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Records", f"{len(reference):,}")
+                c2.metric(
+                    "Total mass",
+                    f"{reference['Mass Inflow (kg/day)'].sum():,.4f} kg/day"
+                )
+                c3.metric(
+                    "Maximum",
+                    f"{reference['Mass Inflow (kg/day)'].max():,.4f} kg/day"
+                )
+                c4.metric(
+                    "Average",
+                    f"{reference['Mass Inflow (kg/day)'].mean():,.4f} kg/day"
+                )
+
+                st.write(
+                    f"**Period:** "
+                    f"{reference['Date/Time'].min().strftime('%d.%m.%Y %H:%M')} "
+                    f"→ "
+                    f"{reference['Date/Time'].max().strftime('%d.%m.%Y %H:%M')}"
+                )
+
+                st.subheader("2. Existing Pollutant Time Series")
+                st.line_chart(
+                    reference.set_index("Date/Time")[
+                        ["Mass Inflow (kg/day)"]
+                    ]
+                )
+
+                st.dataframe(
+                    reference.head(1000),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                st.download_button(
+                    "Download parsed pollutant CSV",
+                    data=reference.to_csv(index=False).encode("utf-8"),
+                    file_name="parsed_swmm_pollutant_inflow.csv",
+                    mime="text/csv",
+                    key="download_reference_pollutant_csv"
+                )
+
+                st.success(
+                    "Reference pollutant data loaded successfully. "
+                    "It is ready to be used as an existing SWMM pollutant "
+                    "inflow reference."
+                )
+
+                st.warning(
+                    "Because no original traffic dataset or traffic-to-"
+                    "pollutant equation was provided, the application does "
+                    "not reverse-calculate vehicle counts from this file."
+                )
+
+            except Exception as exc:
+                st.error(
+                    f"Could not process the SWMM pollutant inflow file: {exc}"
+                )
+
+    # --------------------------------------------------------
+    # RAW TRAFFIC DATA
+    # --------------------------------------------------------
+    else:
+        st.subheader("1. Upload Traffic Dataset")
+
+        traffic_file = st.file_uploader(
+            "Choose a traffic file",
+            type=["csv", "txt", "dat", "xlsx", "xls", "zip"],
+            key="traffic_uploader",
+            help=(
+                "You can upload a single traffic file or a ZIP archive "
+                "containing CSV, TXT, DAT or Excel traffic data."
+            )
+        )
+
+        if traffic_file is None:
+            st.info(
+                "Upload the separate raw traffic dataset here. "
+                "You can also upload a ZIP archive containing the traffic file."
+            )
+        else:
+            try:
+                selected_traffic_file, traffic_extension, traffic_source_name = (
+                    prepare_uploaded_data_file(
+                        traffic_file,
+                        "traffic_zip_member",
+                        "traffic"
+                    )
+                )
+            except Exception as exc:
+                st.error(f"Could not read the uploaded traffic archive: {exc}")
+                st.stop()
+
+            signature = (
+                traffic_file.name,
+                traffic_file.size,
+                traffic_source_name
+            )
+
+            if st.session_state.traffic_file_signature != signature:
+                st.session_state.traffic_data = None
+                st.session_state.traffic_source_info = None
+                st.session_state.pollutant_data = None
+                st.session_state.traffic_file_signature = signature
+
+            try:
+                # Guard against accidentally using the reference inflow file.
+                if traffic_extension in ["dat", "txt"]:
+                    selected_traffic_file.seek(0)
+                    preview_bytes = selected_traffic_file.read(4000)
+                    try:
+                        preview_text = preview_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        preview_text = preview_bytes.decode(
+                            "cp1252", errors="ignore"
+                        )
+
+                    if "external inflow" in preview_text.lower() and (
+                        "mass_inflow" in preview_text.lower()
+                        or "mass inflow" in preview_text.lower()
+                    ):
+                        st.warning(
+                            "This file is an existing SWMM pollutant inflow "
+                            "file, not a raw traffic dataset. Switch the "
+                            "Input type above to **Existing SWMM pollutant "
+                            "inflow DAT**."
+                        )
+                        st.stop()
+
+                sheet_name = None
+
+                if traffic_extension in ["xlsx", "xls"]:
+                    sheets = get_excel_sheets(selected_traffic_file)
+                    sheet_name = st.selectbox(
+                        "Excel sheet",
+                        sheets,
+                        key="traffic_sheet"
+                    )
+
+                raw_traffic, source_info = read_traffic_file(
+                    selected_traffic_file, sheet_name
+                )
+
+                st.success(
+                    f"File read successfully · "
+                    f"{len(raw_traffic):,} raw records"
+                )
+
+                if get_extension(traffic_file.name) == "zip":
+                    st.info(
+                        f"ZIP archive selected: **{traffic_file.name}** → "
+                        f"using **{traffic_source_name}**"
+                    )
+
+                analysis = analyse_traffic_columns(raw_traffic)
+
+                st.subheader("2. Column Detection")
+                st.dataframe(
+                    analysis.sort_values(
+                        ["Date Score", "Traffic Score"],
+                        ascending=False
+                    ),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                date_suggestion = suggest_traffic_date_column(analysis)
+                count_suggestion = suggest_traffic_count_column(analysis)
+
+                columns = list(raw_traffic.columns)
+
+                date_default = (
+                    columns.index(date_suggestion)
+                    if date_suggestion in columns else 0
+                )
+                count_default = (
+                    columns.index(count_suggestion)
+                    if count_suggestion in columns else 0
+                )
+
+                c1, c2 = st.columns(2)
+
+                with c1:
+                    date_col = st.selectbox(
+                        "Date/time column",
+                        columns,
+                        index=date_default,
+                        key="traffic_date_column"
+                    )
+
+                with c2:
+                    count_col = st.selectbox(
+                        "Traffic-count column",
+                        columns,
+                        index=count_default,
+                        key="traffic_count_column"
+                    )
+
+                traffic = prepare_traffic_data(
+                    raw_traffic, date_col, count_col
+                )
+
+                if traffic.empty:
+                    st.error(
+                        "No valid traffic records could be created. "
+                        "Check the selected date/time and traffic columns."
+                    )
+                else:
+                    st.session_state.traffic_data = traffic
+                    st.session_state.traffic_source_info = source_info
+
+                    summary = traffic_summary(traffic)
+
+                    st.subheader("3. Traffic Data Quality")
+
+                    q1, q2, q3, q4 = st.columns(4)
+                    q1.metric("Records", f"{summary['records']:,}")
+                    q2.metric(
+                        "Total vehicles",
+                        f"{summary['total_vehicles']:,.0f}"
+                    )
+                    q3.metric(
+                        "Average / record",
+                        f"{summary['average']:,.1f}"
+                    )
+                    q4.metric(
+                        "Maximum / record",
+                        f"{summary['maximum']:,.0f}"
+                    )
+
+                    st.write(
+                        f"**Period:** "
+                        f"{summary['start'].strftime('%d.%m.%Y %H:%M')} "
+                        f"→ "
+                        f"{summary['end'].strftime('%d.%m.%Y %H:%M')}"
+                    )
+
+                    st.caption(
+                        f"Source: {source_info}. "
+                        f"Negative traffic counts are clipped to zero."
+                    )
+
+                    st.subheader("4. Traffic Time Series")
+                    chart_data = traffic.set_index("Date/Time")[
+                        ["Traffic Count"]
+                    ]
+                    st.line_chart(chart_data)
+
+                    st.subheader("5. Standardized Traffic Data")
+                    st.dataframe(
+                        traffic.head(1000),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    st.download_button(
+                        "Download standardized traffic CSV",
+                        data=traffic.to_csv(
+                            index=False
+                        ).encode("utf-8"),
+                        file_name="NIQKI_standardized_traffic.csv",
+                        mime="text/csv",
+                        key="download_traffic_csv"
+                    )
+
+                    st.info(
+                        "The raw traffic dataset is kept separate from "
+                        "rainfall. It becomes a pollutant-loading input "
+                        "in the next step."
+                    )
+
+            except Exception as exc:
+                st.error(
+                    f"Could not process the traffic file: {exc}"
+                )
+
+# ============================================================
+# POLLUTANT LOADING
+# ============================================================
+
+elif page == "Data Synchronization":
+    st.markdown("## Rainfall–Traffic Data Synchronization")
+    st.markdown(
+        "Align rainfall and traffic observations to a common analysis period and "
+        "controlled temporal resolution before pollutant loading."
+    )
+
+    rainfall_sync = st.session_state.get("rainfall_data")
+    traffic_sync = st.session_state.get("traffic_data")
+
+    if rainfall_sync is None or rainfall_sync.empty:
+        st.warning("Upload and process a rainfall dataset first.")
+    elif traffic_sync is None or traffic_sync.empty:
+        st.warning("Upload and process a raw traffic dataset first.")
+    else:
+        rain = rainfall_sync.copy()
+        traf = traffic_sync.copy()
+
+        rain["Date/Time"] = pd.to_datetime(rain["Date/Time"], errors="coerce")
+        rain["Rainfall (mm)"] = pd.to_numeric(rain["Rainfall (mm)"], errors="coerce")
+        traf["Date/Time"] = pd.to_datetime(traf["Date/Time"], errors="coerce")
+        traf["Traffic Count"] = pd.to_numeric(traf["Traffic Count"], errors="coerce")
+
+        rain = rain.dropna(subset=["Date/Time"]).sort_values("Date/Time")
+        traf = traf.dropna(subset=["Date/Time"]).sort_values("Date/Time")
+
+        if rain.empty or traf.empty:
+            st.error("One of the datasets does not contain valid date/time records.")
+        else:
+            rain_start, rain_end = rain["Date/Time"].min(), rain["Date/Time"].max()
+            traf_start, traf_end = traf["Date/Time"].min(), traf["Date/Time"].max()
+
+            overlap_start = max(rain_start, traf_start)
+            overlap_end = min(rain_end, traf_end)
+            overlap_exists = overlap_start <= overlap_end
+
+            rain_res = detect_temporal_resolution(rain["Date/Time"])
+            traf_res = detect_temporal_resolution(traf["Date/Time"])
+
+            def _minutes_from_resolution(value):
+                if value is None:
+                    return None
+                if isinstance(value, (int, float, np.integer, np.floating)):
+                    return float(value)
+                text = str(value).lower()
+                m = re.search(r"(\d+(?:\.\d+)?)\s*(minute|min|hour|hr|day)", text)
+                if not m:
+                    return None
+                number = float(m.group(1))
+                unit = m.group(2)
+                if unit.startswith("hour") or unit == "hr":
+                    number *= 60
+                elif unit.startswith("day"):
+                    number *= 1440
+                return number
+
+            rain_min = _minutes_from_resolution(rain_res)
+            traf_min = _minutes_from_resolution(traf_res)
+
+            st.markdown("### Source dataset periods")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Rainfall**")
+                st.write(f"Records: **{len(rain):,}**")
+                st.write(f"Period: **{rain_start:%d.%m.%Y %H:%M} → {rain_end:%d.%m.%Y %H:%M}**")
+                st.write(f"Detected resolution: **{rain_res or 'Unknown'}**")
+            with c2:
+                st.markdown("**Traffic**")
+                st.write(f"Records: **{len(traf):,}**")
+                st.write(f"Period: **{traf_start:%d.%m.%Y %H:%M} → {traf_end:%d.%m.%Y %H:%M}**")
+                st.write(f"Detected resolution: **{traf_res or 'Unknown'}**")
+
+            if not overlap_exists:
+                st.error(
+                    "No common time period exists between the rainfall and traffic datasets. "
+                    "They cannot be synchronized without changing the source periods."
+                )
+            else:
+                overlap_days = (overlap_end - overlap_start).total_seconds() / 86400.0
+
+                st.markdown("### Synchronization check")
+                s1, s2, s3, s4 = st.columns(4)
+                with s1:
+                    st.metric("Common period", f"{overlap_days:.1f} days")
+                with s2:
+                    st.metric("Overlap start", overlap_start.strftime("%d.%m.%Y"))
+                with s3:
+                    st.metric("Overlap end", overlap_end.strftime("%d.%m.%Y"))
+                with s4:
+                    if rain_min and traf_min:
+                        st.metric(
+                            "Resolution",
+                            "Compatible" if abs(rain_min - traf_min) < 1e-9 else "Different"
+                        )
+                    else:
+                        st.metric("Resolution", "Review")
+
+                if rain_min and traf_min and abs(rain_min - traf_min) < 1e-9:
+                    st.success("Rainfall and traffic have compatible detected recording intervals.")
+                elif rain_min and traf_min:
+                    st.info(
+                        "The source resolutions differ. The finer dataset will be aggregated "
+                        "to the selected common interval."
+                    )
+                else:
+                    st.warning(
+                        "At least one source has an unknown or irregular resolution. "
+                        "Review the synchronized output carefully."
+                    )
+
+                def _label_minutes(minutes):
+                    if minutes >= 1440 and abs(minutes / 1440 - round(minutes / 1440)) < 1e-9:
+                        days = int(round(minutes / 1440))
+                        return f"{days} day" if days == 1 else f"{days} days"
+                    if minutes >= 60 and abs(minutes / 60 - round(minutes / 60)) < 1e-9:
+                        hours = int(round(minutes / 60))
+                        return f"{hours} hour" if hours == 1 else f"{hours} hours"
+                    return f"{int(minutes)} minutes"
+
+                common_default = max(rain_min, traf_min) if rain_min and traf_min else (rain_min or traf_min or 1440.0)
+
+                options = []
+                if rain_min:
+                    options.append(("rainfall", rain_min, f"Rainfall interval ({_label_minutes(rain_min)})"))
+                if traf_min and not any(abs(traf_min - x[1]) < 1e-9 for x in options):
+                    options.append(("traffic", traf_min, f"Traffic interval ({_label_minutes(traf_min)})"))
+                if rain_min and traf_min and abs(rain_min - traf_min) > 1e-9:
+                    options.append(("coarser", max(rain_min, traf_min),
+                                    f"Recommended common interval ({_label_minutes(max(rain_min, traf_min))})"))
+                options.append(("custom", None, "Custom interval"))
+
+                labels = [x[2] for x in options]
+                default_index = next(
+                    (i for i, x in enumerate(options)
+                     if x[0] == "coarser" or (x[1] is not None and abs(x[1] - common_default) < 1e-9)),
+                    0
+                )
+
+                selected_label = st.selectbox(
+                    "Synchronization interval",
+                    labels,
+                    index=default_index,
+                    key="sync_interval_choice"
+                )
+                selected_kind, selected_minutes, _ = options[labels.index(selected_label)]
+
+                if selected_kind == "custom":
+                    selected_minutes = st.number_input(
+                        "Custom interval (minutes)",
+                        min_value=1.0,
+                        value=float(common_default),
+                        step=1.0,
+                        key="sync_custom_minutes"
+                    )
+
+                traffic_mode = st.selectbox(
+                    "Traffic variable interpretation",
+                    [
+                        "Counts per recording interval (sum when aggregating)",
+                        "Rate (vehicles/hour; average when aggregating)",
+                    ],
+                    help=(
+                        "Choose counts when each record is a vehicle total for its interval. "
+                        "Choose rate when values represent vehicles/hour."
+                    ),
+                    key="sync_traffic_mode"
+                )
+
+                st.caption(
+                    "Rainfall is always aggregated by summing interval depths. Traffic is "
+                    "summed for interval counts or averaged for rates."
+                )
+
+                if selected_minutes and selected_minutes > 0:
+                    freq = f"{int(selected_minutes)}min"
+
+                    rain_common = rain[
+                        (rain["Date/Time"] >= overlap_start) &
+                        (rain["Date/Time"] <= overlap_end)
+                    ].copy()
+                    traf_common = traf[
+                        (traf["Date/Time"] >= overlap_start) &
+                        (traf["Date/Time"] <= overlap_end)
+                    ].copy()
+
+                    rain_common = (
+                        rain_common.set_index("Date/Time")["Rainfall (mm)"]
+                        .resample(freq)
+                        .sum(min_count=1)
+                        .rename("Rainfall (mm)")
+                        .reset_index()
+                    )
+
+                    traffic_series = traf_common.set_index("Date/Time")["Traffic Count"]
+                    if traffic_mode.startswith("Counts"):
+                        traffic_series = traffic_series.resample(freq).sum(min_count=1)
+                    else:
+                        traffic_series = traffic_series.resample(freq).mean()
+                    traf_common = traffic_series.rename("Traffic Count").reset_index()
+
+                    synchronized = pd.merge(
+                        rain_common, traf_common, on="Date/Time", how="outer"
+                    ).sort_values("Date/Time")
+
+                    # Keep bins that actually intersect the source overlap.
+                    bin_end = synchronized["Date/Time"] + pd.to_timedelta(
+                        float(selected_minutes), unit="m"
+                    )
+                    synchronized = synchronized[
+                        (synchronized["Date/Time"] <= overlap_end) &
+                        (bin_end > overlap_start)
+                    ].copy()
+
+                    rain_missing = int(synchronized["Rainfall (mm)"].isna().sum())
+                    traffic_missing = int(synchronized["Traffic Count"].isna().sum())
+
+                    st.markdown("### Synchronization result")
+                    r1, r2, r3, r4 = st.columns(4)
+                    with r1:
+                        st.metric("Synchronized records", f"{len(synchronized):,}")
+                    with r2:
+                        st.metric("Rainfall gaps", f"{rain_missing:,}")
+                    with r3:
+                        st.metric("Traffic gaps", f"{traffic_missing:,}")
+                    with r4:
+                        st.metric("Common interval", _label_minutes(float(selected_minutes)))
+
+                    if len(synchronized) == 0:
+                        st.error("No synchronized records were produced.")
+                    else:
+                        if rain_missing == 0 and traffic_missing == 0:
+                            st.success("Synchronization completed with no missing aligned values.")
+                        else:
+                            st.warning(
+                                "Synchronization completed with missing aligned values. "
+                                "Missing values are not automatically converted to zero."
+                            )
+
+                        st.dataframe(
+                            synchronized.head(100),
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                        if len(synchronized) > 100:
+                            st.caption("Showing the first 100 synchronized records.")
+
+                        st.session_state.synchronized_data = synchronized
+                        st.session_state.sync_summary = {
+                            "rainfall_start": rain_start,
+                            "rainfall_end": rain_end,
+                            "traffic_start": traf_start,
+                            "traffic_end": traf_end,
+                            "overlap_start": overlap_start,
+                            "overlap_end": overlap_end,
+                            "overlap_days": overlap_days,
+                            "rainfall_resolution": rain_res,
+                            "traffic_resolution": traf_res,
+                            "sync_interval_minutes": float(selected_minutes),
+                            "traffic_mode": traffic_mode,
+                            "records": len(synchronized),
+                            "rainfall_missing": rain_missing,
+                            "traffic_missing": traffic_missing,
+                        }
+
+                        st.download_button(
+                            "Download synchronized CSV",
+                            data=synchronized.to_csv(index=False).encode("utf-8"),
+                            file_name="NIQKI_synchronized_rainfall_traffic.csv",
+                            mime="text/csv",
+                            key="download_synchronized_csv"
+                        )
+
+                        st.info(
+                            "The synchronized dataset is ready for pollutant-loading analysis. "
+                            "No emission factor or pollutant calculation is applied on this page."
+                        )
+                else:
+                    st.error("Synchronization interval must be greater than zero.")
+
+elif page == "Pollutant Loading":
+    st.title("Pollutant Loading")
+    st.write(
+        "Convert the standardized traffic time series into a pollutant "
+        "mass-inflow time series suitable for preparation as an SWMM "
+        "external inflow file."
+    )
+
+    if (
+        st.session_state.traffic_data is None
+        and st.session_state.pollutant_reference_data is not None
+    ):
+        reference = st.session_state.pollutant_reference_data.copy()
+
+        st.info(
+            "An existing SWMM pollutant inflow reference is loaded. "
+            "This can be inspected and exported here, but it is not "
+            "treated as raw traffic data."
+        )
+
+        st.subheader("1. Existing SWMM Pollutant Inflow")
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Records", f"{len(reference):,}")
+        c2.metric(
+            "Total mass",
+            f"{reference['Mass Inflow (kg/day)'].sum():,.4f} kg/day"
+        )
+        c3.metric(
+            "Maximum",
+            f"{reference['Mass Inflow (kg/day)'].max():,.4f} kg/day"
+        )
+
+        st.line_chart(
+            reference.set_index("Date/Time")[
+                ["Mass Inflow (kg/day)"]
+            ]
+        )
+
+        st.dataframe(
+            reference.head(1000),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        dat_text = generate_swmm_inflow_dat(
+            reference,
+            title="Existing SWMM Pollutant Inflow Reference"
+        )
+
+        st.subheader("2. SWMM External Inflow DAT Preview")
+        st.code(
+            "\n".join(dat_text.splitlines()[:15]),
+            language="text"
+        )
+
+        st.download_button(
+            "Download SWMM pollutant inflow DAT",
+            data=dat_text.encode("utf-8"),
+            file_name="twp_swmm_inflow_reference.dat",
+            mime="text/plain",
+            key="download_reference_pollutant_dat"
+        )
+
+        st.warning(
+            "The original traffic-to-pollutant calculation that produced "
+            "this reference file is unknown. Do not use it to infer a "
+            "traffic emission factor unless that methodology is documented."
+        )
+
+    elif st.session_state.traffic_data is None:
+        st.warning(
+            "No traffic dataset is loaded. Go to **Traffic Data** first."
+        )
+    else:
+        traffic = st.session_state.traffic_data.copy()
+
+        st.subheader("1. Pollutant Loading Parameters")
+
+        st.warning(
+            "The original traffic-to-pollutant calculation behind the "
+            "reference SWMM inflow file was not provided. Therefore, this "
+            "page does not claim a source-specific emission factor. "
+            "Enter the emission factor required by your chosen "
+            "NIQKI/literature methodology."
+        )
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            emission_factor = st.number_input(
+                "Emission factor (g pollutant / vehicle / day)",
+                min_value=0.0,
+                value=1.0,
+                step=0.01,
+                format="%.4f",
+                help=(
+                    "Use the value specified by your project methodology "
+                    "or literature source."
+                )
+            )
+
+        with c2:
+            scale_factor = st.number_input(
+                "Scenario scale factor",
+                min_value=0.0,
+                value=1.0,
+                step=0.1,
+                format="%.4f",
+                help=(
+                    "Optional multiplicative scenario factor. "
+                    "Keep at 1.0 unless your methodology specifies otherwise."
+                )
+            )
+
+        st.markdown("### Calculation")
+
+        st.latex(
+            r"M_{\mathrm{pollutant}}"
+            r"=\frac{N_{\mathrm{vehicles}}\times EF\times S}{1000}"
+        )
+
+        st.caption(
+            "M = pollutant mass [kg/day]; N = traffic count [vehicles/day]; "
+            "EF = emission factor [g/vehicle/day]; S = scenario scale factor."
+        )
+
+        if st.button(
+            "Calculate pollutant loading",
+            type="primary",
+            key="calculate_pollutant_loading"
+        ):
+            pollutant = calculate_pollutant_loading(
+                traffic,
+                emission_factor,
+                scale_factor
+            )
+
+            st.session_state.pollutant_data = pollutant
+            st.session_state.traffic_parameters = {
+                "emission_factor_g_per_vehicle_day": emission_factor,
+                "scale_factor": scale_factor
+            }
+
+        if st.session_state.pollutant_data is not None:
+            pollutant = st.session_state.pollutant_data.copy()
+
+            st.subheader("2. Pollutant Loading Results")
+
+            total_mass = float(
+                pollutant["Mass Inflow (kg/day)"].sum()
+            )
+            maximum_mass = float(
+                pollutant["Mass Inflow (kg/day)"].max()
+            )
+            average_mass = float(
+                pollutant["Mass Inflow (kg/day)"].mean()
+            )
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total mass", f"{total_mass:,.4f} kg")
+            c2.metric("Average mass", f"{average_mass:,.4f} kg/day")
+            c3.metric("Maximum", f"{maximum_mass:,.4f} kg/day")
+
+            chart = pollutant.set_index("Date/Time")[
+                ["Mass Inflow (kg/day)"]
+            ]
+            st.line_chart(chart)
+
+            st.dataframe(
+                pollutant.head(1000),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            csv_bytes = pollutant.to_csv(
+                index=False
+            ).encode("utf-8")
+
+            st.download_button(
+                "Download pollutant time series CSV",
+                data=csv_bytes,
+                file_name="NIQKI_pollutant_time_series.csv",
+                mime="text/csv",
+                key="download_pollutant_csv"
+            )
+
+            st.subheader("3. SWMM External Inflow File")
+
+            dat_text = generate_swmm_inflow_dat(
+                pollutant,
+                title="NIQKI Traffic-Based Pollutant Loading"
+            )
+
+            st.code(
+                "\n".join(dat_text.splitlines()[:15]),
+                language="text"
+            )
+
+            st.download_button(
+                "Download SWMM pollutant inflow DAT",
+                data=dat_text.encode("utf-8"),
+                file_name="twp_swmm_inflow.dat",
+                mime="text/plain",
+                key="download_pollutant_dat"
+            )
+
+            st.info(
+                "This DAT file is a pollutant mass-inflow time series. "
+                "It is separate from the rainfall Rain Gage DAT file. "
+                "The pollutant object/inflow configuration in EPA SWMM "
+                "must reference the correct time series according to your "
+                "SWMM model setup."
+            )
 
 # ============================================================
 # MODEL PARAMETERS
