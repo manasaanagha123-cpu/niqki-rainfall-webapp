@@ -98,7 +98,9 @@ defaults = {
     "pollutant_data": None,
     "traffic_parameters": None,
     "pollutant_reference_data": None,
-    "pollutant_reference_source_info": None
+    "pollutant_reference_source_info": None,
+    "synchronized_data": None,
+    "sync_summary": None
 }
 
 for key, value in defaults.items():
@@ -174,7 +176,6 @@ def extract_zip_member(uploaded_file, member_name):
 
     file_obj = BytesIO(data)
     file_obj.name = member_name.rsplit("/", 1)[-1]
-    file_obj.size = len(data)
     return file_obj
 
 
@@ -480,25 +481,39 @@ def standardize_rainfall_data(df, date_column, rainfall_column):
 # TEMPORAL RESOLUTION / QUALITY
 # ============================================================
 
-def detect_temporal_resolution(df):
-    dates = (
-        df["Date/Time"]
-        .dropna()
-        .sort_values()
-        .drop_duplicates()
-    )
+def detect_temporal_resolution(data):
+    """
+    Detect the dominant temporal interval.
+
+    Accepts either a DataFrame containing a ``Date/Time`` column or a
+    pandas Series containing timestamps.
+
+    Returns:
+        (resolution_label, interval_minutes, irregular_percentage)
+    """
+    if isinstance(data, pd.DataFrame):
+        if "Date/Time" not in data.columns:
+            return "Unknown", None, 0.0
+        dates = data["Date/Time"]
+    else:
+        dates = data
+
+    dates = pd.to_datetime(dates, errors="coerce").dropna()
+    dates = dates.sort_values().drop_duplicates()
 
     if len(dates) < 2:
         return "Unknown", None, 0.0
 
-    differences = dates.diff().dropna().dt.total_seconds() / 60
+    differences = dates.diff().dropna().dt.total_seconds() / 60.0
     differences = differences[differences > 0]
 
     if differences.empty:
         return "Unknown", None, 0.0
 
     mode = differences.mode()
-    interval = float(mode.iloc[0]) if not mode.empty else float(differences.median())
+    interval = float(
+        mode.iloc[0] if not mode.empty else differences.median()
+    )
 
     known = {
         1: "1 minute",
@@ -516,15 +531,19 @@ def detect_temporal_resolution(df):
     }
 
     resolution = next(
-        (label for minutes, label in known.items() if abs(interval - minutes) < 0.01),
-        f"{interval:.2f} minutes" if interval < 60 else f"{interval / 60:.2f} hours"
+        (
+            label for minutes, label in known.items()
+            if abs(interval - minutes) < 0.01
+        ),
+        f"{interval:.2f} minutes"
+        if interval < 60
+        else f"{interval / 60:.2f} hours"
     )
 
-    irregular = (abs(differences - interval) > 0.01).sum()
-    irregular_percentage = irregular / len(differences) * 100
+    irregular = int((abs(differences - interval) > 0.01).sum())
+    irregular_percentage = irregular / len(differences) * 100.0
 
     return resolution, interval, irregular_percentage
-
 
 def calculate_quality(df):
     total = len(df)
@@ -1205,7 +1224,7 @@ if st.session_state.get("synchronized_data") is not None:
 else:
     st.sidebar.info("Rainfall–traffic synchronization pending")
 
-st.sidebar.caption("NIQKI Web Application · v1.1")
+st.sidebar.caption("NIQKI Web Application · v1.4.2")
 
 # ============================================================
 # HOME
@@ -2088,28 +2107,12 @@ elif page == "Data Synchronization":
             overlap_end = min(rain_end, traf_end)
             overlap_exists = overlap_start <= overlap_end
 
-            rain_res = detect_temporal_resolution(rain["Date/Time"])
-            traf_res = detect_temporal_resolution(traf["Date/Time"])
-
-            def _minutes_from_resolution(value):
-                if value is None:
-                    return None
-                if isinstance(value, (int, float, np.integer, np.floating)):
-                    return float(value)
-                text = str(value).lower()
-                m = re.search(r"(\d+(?:\.\d+)?)\s*(minute|min|hour|hr|day)", text)
-                if not m:
-                    return None
-                number = float(m.group(1))
-                unit = m.group(2)
-                if unit.startswith("hour") or unit == "hr":
-                    number *= 60
-                elif unit.startswith("day"):
-                    number *= 1440
-                return number
-
-            rain_min = _minutes_from_resolution(rain_res)
-            traf_min = _minutes_from_resolution(traf_res)
+            rain_res, rain_min, rain_irregular = detect_temporal_resolution(
+                rain["Date/Time"]
+            )
+            traf_res, traf_min, traf_irregular = detect_temporal_resolution(
+                traf["Date/Time"]
+            )
 
             st.markdown("### Source dataset periods")
             c1, c2 = st.columns(2)
