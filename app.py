@@ -1179,6 +1179,7 @@ page = st.sidebar.radio(
         "Home",
         "Rainfall Data",
         "Traffic Data",
+        "Data Synchronization",
         "Pollutant Loading",
         "Model Parameters",
         "Simulation",
@@ -1198,6 +1199,11 @@ if st.session_state.get("traffic_data") is not None:
     st.sidebar.success("Traffic dataset loaded")
 else:
     st.sidebar.info("No traffic dataset loaded")
+
+if st.session_state.get("synchronized_data") is not None:
+    st.sidebar.success("Rainfall–traffic data synchronized")
+else:
+    st.sidebar.info("Rainfall–traffic synchronization pending")
 
 st.sidebar.caption("NIQKI Web Application · v1.1")
 
