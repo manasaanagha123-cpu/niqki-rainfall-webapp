@@ -100,7 +100,12 @@ defaults = {
     "pollutant_reference_data": None,
     "pollutant_reference_source_info": None,
     "synchronized_data": None,
-    "sync_summary": None
+    "sync_summary": None,
+    "bast_stations": None,
+    "bast_signature": None,
+    "bast_daily_data": None,
+    "bast_selected_station": None,
+    "bast_source_info": None
 }
 
 for key, value in defaults.items():
@@ -1181,6 +1186,538 @@ def traffic_summary(data):
 
 
 # ============================================================
+# BASt / mFUND TRAFFIC DATA
+# ============================================================
+
+BAST_REQUIRED_COLUMNS = [
+    "Zst", "Datum", "Stunde",
+    "KFZ_R1", "KFZ_R2",
+    "Pkw_R1", "Pkw_R2",
+    "Lfw_R1", "Lfw_R2",
+    "Lkw_R1", "Lkw_R2",
+    "Lzg_R1", "Lzg_R2",
+    "Sat_R1", "Sat_R2",
+    "Bus_R1", "Bus_R2"
+]
+
+BAST_EMISSION_DEFAULTS = {
+    "EF_PKW_mg_veh_km": 90.0,
+    "EF_LKW_mg_veh_km": 800.0,
+    "EF_BUS_mg_veh_km": 700.0,
+    "K_drive": 1.3,
+    "K_road": 1.1,
+    "eta_verge": 0.40,
+    "eta_trap": 0.30,
+    "k_loss": 0.05,
+    "C1_washoff": 0.05,
+    "C2_washoff": 1.3,
+}
+
+def _zip_member_name(uploaded_file):
+    uploaded_file.seek(0)
+    with zipfile.ZipFile(uploaded_file) as archive:
+        candidates = [
+            info.filename for info in archive.infolist()
+            if not info.is_dir()
+            and info.filename.lower().endswith((".txt", ".csv", ".tsv"))
+            and not info.filename.replace("\\", "/").split("/")[-1].startswith(".")
+        ]
+    if not candidates:
+        raise ValueError("No TXT/CSV/TSV traffic file was found inside the ZIP archive.")
+    return candidates[0]
+
+def _open_bast_source(uploaded_file):
+    """
+    Return a ZipFile member stream for a ZIP or the uploaded file itself.
+    The caller is responsible for closing the returned archive when needed.
+    """
+    ext = get_extension(uploaded_file.name)
+    if ext == "zip":
+        uploaded_file.seek(0)
+        archive = zipfile.ZipFile(uploaded_file)
+        member = _zip_member_name(uploaded_file)
+        return archive, archive.open(member, "r"), member
+    uploaded_file.seek(0)
+    return None, uploaded_file, uploaded_file.name
+
+def is_bast_mfund_header(uploaded_file):
+    try:
+        archive, stream, member = _open_bast_source(uploaded_file)
+        try:
+            sample = pd.read_csv(
+                stream,
+                sep=";",
+                dtype=str,
+                nrows=3,
+                usecols=lambda c: str(c).strip() in BAST_REQUIRED_COLUMNS
+            )
+        finally:
+            if archive is not None:
+                archive.close()
+        cols = {str(c).strip() for c in sample.columns}
+        return {"Zst", "Datum", "Stunde"}.issubset(cols)
+    except Exception:
+        return False
+
+def bast_list_stations(uploaded_file, chunksize=250_000):
+    """
+    Memory-safe station discovery. Only the Zst column is read from the
+    potentially 1+ GB decompressed BASt text file.
+    """
+    archive, stream, member = _open_bast_source(uploaded_file)
+    stations = set()
+    try:
+        for chunk in pd.read_csv(
+            stream,
+            sep=";",
+            dtype={"Zst": "string"},
+            usecols=["Zst"],
+            chunksize=chunksize,
+            low_memory=True,
+            on_bad_lines="skip"
+        ):
+            values = (
+                chunk["Zst"]
+                .astype("string")
+                .str.strip()
+                .dropna()
+            )
+            stations.update(v for v in values.tolist() if str(v).strip())
+    finally:
+        if archive is not None:
+            archive.close()
+    return sorted(stations)
+
+def bast_process_station(uploaded_file, selected_zst, chunksize=200_000):
+    """
+    Reproduce the user's working roadandrain.py traffic aggregation without
+    loading the complete 1.44 GB TXT file into memory.
+
+    The original method:
+      - filters by Zst
+      - sums both traffic directions
+      - groups vehicle classes
+      - parses Datum as YYMMDD
+      - aggregates to daily values
+    """
+    archive, stream, member = _open_bast_source(uploaded_file)
+
+    available_columns = None
+    daily_parts = []
+
+    usecols = [
+        c for c in BAST_REQUIRED_COLUMNS
+        if c in BAST_REQUIRED_COLUMNS
+    ]
+
+    try:
+        for chunk in pd.read_csv(
+            stream,
+            sep=";",
+            dtype=str,
+            usecols=usecols,
+            chunksize=chunksize,
+            low_memory=True,
+            on_bad_lines="skip"
+        ):
+            chunk.columns = [str(c).strip() for c in chunk.columns]
+
+            if "Zst" not in chunk.columns:
+                continue
+
+            site = chunk[
+                chunk["Zst"].astype(str).str.strip() == str(selected_zst).strip()
+            ].copy()
+
+            if site.empty:
+                continue
+
+            # Exact vehicle groups from the user's original script.
+            def num_sum(names):
+                total = pd.Series(0.0, index=site.index)
+                for name in names:
+                    if name in site.columns:
+                        total = total + pd.to_numeric(
+                            site[name], errors="coerce"
+                        ).fillna(0.0)
+                return total
+
+            site["PKW_Van"] = num_sum([
+                "Pkw_R1", "Pkw_R2", "Lfw_R1", "Lfw_R2"
+            ])
+            site["LKW"] = num_sum([
+                "Lkw_R1", "Lkw_R2",
+                "Lzg_R1", "Lzg_R2",
+                "Sat_R1", "Sat_R2"
+            ])
+            site["Bus"] = num_sum([
+                "Bus_R1", "Bus_R2"
+            ])
+            site["Traffic Count"] = num_sum([
+                "KFZ_R1", "KFZ_R2"
+            ])
+
+            site["Date/Time"] = pd.to_datetime(
+                site["Datum"].astype(str).str.strip(),
+                format="%y%m%d",
+                errors="coerce"
+            )
+
+            site = site.dropna(subset=["Date/Time"])
+
+            if site.empty:
+                continue
+
+            part = (
+                site.groupby("Date/Time", as_index=False)[
+                    ["PKW_Van", "LKW", "Bus", "Traffic Count"]
+                ].sum()
+            )
+            daily_parts.append(part)
+
+    finally:
+        if archive is not None:
+            archive.close()
+
+    if not daily_parts:
+        return pd.DataFrame(
+            columns=[
+                "Date/Time", "PKW_Van", "LKW", "Bus", "Traffic Count"
+            ]
+        )
+
+    daily = (
+        pd.concat(daily_parts, ignore_index=True)
+        .groupby("Date/Time", as_index=False)[
+            ["PKW_Van", "LKW", "Bus", "Traffic Count"]
+        ].sum()
+        .sort_values("Date/Time")
+        .reset_index(drop=True)
+    )
+
+    daily["Station Zst"] = str(selected_zst)
+    return daily
+
+def bast_calculate_twp_hourly(
+    traffic_daily,
+    road_length_km,
+    ef_pkw=90.0,
+    ef_lkw=800.0,
+    ef_bus=700.0,
+    k_drive=1.3,
+    k_road=1.1
+):
+    """
+    Exact emission-factor calculation used in the user's working script.
+
+    Result is daily generation because the original script sums hourly
+    generation across all hourly observations for each day.
+    """
+    data = traffic_daily.copy()
+
+    data["TWP_Hourly_kg"] = (
+        (
+            data["PKW_Van"] * float(ef_pkw)
+            + data["LKW"] * float(ef_lkw)
+            + data["Bus"] * float(ef_bus)
+        )
+        * float(road_length_km)
+        * float(k_drive)
+        * float(k_road)
+        / 1e6
+    )
+
+    return data
+
+def bast_daily_washoff(
+    merged_daily,
+    k_loss=0.05,
+    c1_washoff=0.05,
+    c2_washoff=1.3,
+    eta_verge=0.40,
+    eta_trap=0.30
+):
+    """
+    Exact daily buildup/wash-off formulation from roadandrain.py.
+    """
+    data = merged_daily.copy().sort_values("Date/Time").reset_index(drop=True)
+
+    if data.empty:
+        data["Sewer_Mass_kg"] = []
+        return data
+
+    B = float(data["M_gen_daily_kg"].iloc[0]) / float(k_loss)
+    sewer_mass = []
+
+    for _, row in data.iterrows():
+        m_gen = float(row["M_gen_daily_kg"])
+        day_rain = float(row.get("Rainfall_mm", row.get("Rainfall (mm)", 0.0)))
+
+        b_before = (
+            B * np.exp(-float(k_loss) * 1.0)
+            + (m_gen / float(k_loss))
+            * (1.0 - np.exp(-float(k_loss) * 1.0))
+        )
+
+        if day_rain > 0:
+            q = day_rain / 2.0
+            w_rate = float(c1_washoff) * (q ** float(c2_washoff)) * b_before
+            mass_washed = min(w_rate * 2.0, b_before)
+        else:
+            mass_washed = 0.0
+
+        B = b_before - mass_washed
+        mass_to_sewer = (
+            mass_washed
+            * (1.0 - float(eta_verge))
+            * (1.0 - float(eta_trap))
+        )
+        sewer_mass.append(mass_to_sewer)
+
+    data["Sewer_Mass_kg"] = sewer_mass
+    return data
+
+
+
+# ============================================================
+# GENERIC TRAFFIC FILE HELPERS
+# ============================================================
+
+def traffic_detect_text_source(uploaded_file):
+    """
+    Inspect only the beginning of a TXT/CSV/DAT/ZIP member.
+    This avoids loading a large traffic file into memory.
+    """
+    ext = get_extension(uploaded_file.name)
+    archive = None
+    stream = None
+    member = None
+
+    try:
+        if ext == "zip":
+            uploaded_file.seek(0)
+            archive = zipfile.ZipFile(uploaded_file)
+            members = [
+                i.filename for i in archive.infolist()
+                if not i.is_dir()
+                and i.filename.lower().endswith(
+                    (".txt", ".csv", ".tsv", ".dat")
+                )
+            ]
+            if not members:
+                raise ValueError("No supported TXT/CSV/TSV/DAT file found in ZIP.")
+            member = members[0]
+            stream = archive.open(member, "r")
+        else:
+            uploaded_file.seek(0)
+            stream = uploaded_file
+
+        raw = stream.read(256 * 1024)
+        if isinstance(raw, str):
+            text = raw
+        else:
+            text = None
+            for enc in ["utf-8-sig", "utf-8", "cp1252", "latin1"]:
+                try:
+                    text = raw.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if text is None:
+                raise ValueError("Could not decode the traffic file preview.")
+
+        lines = [line for line in text.splitlines() if line.strip()]
+        if not lines:
+            raise ValueError("The traffic file appears to be empty.")
+
+        # Find the first plausible header line. BASt files normally use ';'.
+        header_line = next(
+            (line for line in lines if not line.lstrip().startswith(";")),
+            lines[0]
+        )
+
+        candidates = [";", "\t", ",", "|"]
+        sep = max(
+            candidates,
+            key=lambda s: header_line.count(s)
+        )
+        if header_line.count(sep) == 0:
+            sep = r"\s+"
+
+        return {
+            "extension": ext,
+            "member": member,
+            "separator": sep,
+            "encoding": enc if 'enc' in locals() else "utf-8"
+        }
+    finally:
+        if archive is not None:
+            archive.close()
+
+def traffic_text_columns(uploaded_file, separator, encoding):
+    """Read only the header from a text/ZIP traffic source."""
+    ext = get_extension(uploaded_file.name)
+    archive = None
+    stream = None
+    try:
+        if ext == "zip":
+            uploaded_file.seek(0)
+            archive = zipfile.ZipFile(uploaded_file)
+            member = _zip_member_name(uploaded_file)
+            stream = archive.open(member, "r")
+        else:
+            uploaded_file.seek(0)
+            stream = uploaded_file
+
+        header = pd.read_csv(
+            stream,
+            sep=separator,
+            encoding=encoding,
+            nrows=0,
+            engine="python"
+        )
+        return [str(c).strip() for c in header.columns]
+    finally:
+        if archive is not None:
+            archive.close()
+
+def generic_traffic_process(
+    uploaded_file,
+    date_column,
+    count_column,
+    separator,
+    encoding,
+    station_column=None,
+    station_value=None,
+    chunksize=200_000
+):
+    """
+    Generic, memory-safe traffic processor.
+
+    Works for ordinary traffic datasets and large delimited files.
+    If a station column/value is supplied, only that station is retained.
+    """
+    ext = get_extension(uploaded_file.name)
+
+    if ext in ["xlsx", "xls"]:
+        raw = read_excel_sheet(uploaded_file, None)
+        if station_column and station_value is not None:
+            raw = raw[
+                raw[station_column].astype(str).str.strip()
+                == str(station_value).strip()
+            ]
+        return prepare_traffic_data(raw, date_column, count_column)
+
+    archive = None
+    stream = None
+    if ext == "zip":
+        uploaded_file.seek(0)
+        archive = zipfile.ZipFile(uploaded_file)
+        member = _zip_member_name(uploaded_file)
+        stream = archive.open(member, "r")
+    else:
+        uploaded_file.seek(0)
+        stream = uploaded_file
+
+    parts = []
+    usecols = [date_column, count_column]
+    if station_column and station_column not in usecols:
+        usecols.append(station_column)
+
+    try:
+        for chunk in pd.read_csv(
+            stream,
+            sep=separator,
+            encoding=encoding,
+            dtype=str,
+            usecols=usecols,
+            chunksize=chunksize,
+            low_memory=True,
+            engine="python",
+            on_bad_lines="skip"
+        ):
+            chunk.columns = [str(c).strip() for c in chunk.columns]
+
+            if station_column and station_value is not None:
+                chunk = chunk[
+                    chunk[station_column].astype(str).str.strip()
+                    == str(station_value).strip()
+                ]
+
+            if chunk.empty:
+                continue
+
+            prepared = prepare_traffic_data(
+                chunk, date_column, count_column
+            )
+            if not prepared.empty:
+                parts.append(prepared)
+
+    finally:
+        if archive is not None:
+            archive.close()
+
+    if not parts:
+        return pd.DataFrame(columns=["Date/Time", "Traffic Count"])
+
+    result = (
+        pd.concat(parts, ignore_index=True)
+        .groupby("Date/Time", as_index=False)["Traffic Count"]
+        .sum()
+        .sort_values("Date/Time")
+        .reset_index(drop=True)
+    )
+    return result
+
+def generic_traffic_is_bast(columns):
+    normalized = {str(c).strip().lower() for c in columns}
+    return {
+        "zst", "datum", "stunde", "kfz_r1", "kfz_r2"
+    }.issubset(normalized)
+
+def generic_traffic_station_values(
+    uploaded_file, station_column, separator, encoding, chunksize=250_000
+):
+    """Return unique station values without loading the full source."""
+    ext = get_extension(uploaded_file.name)
+    archive = None
+    stream = None
+    values = set()
+
+    try:
+        if ext == "zip":
+            uploaded_file.seek(0)
+            archive = zipfile.ZipFile(uploaded_file)
+            member = _zip_member_name(uploaded_file)
+            stream = archive.open(member, "r")
+        else:
+            uploaded_file.seek(0)
+            stream = uploaded_file
+
+        for chunk in pd.read_csv(
+            stream,
+            sep=separator,
+            encoding=encoding,
+            dtype={station_column: str},
+            usecols=[station_column],
+            chunksize=chunksize,
+            low_memory=True,
+            engine="python",
+            on_bad_lines="skip"
+        ):
+            values.update(
+                v for v in
+                chunk[station_column].astype(str).str.strip().dropna().tolist()
+                if v and v.lower() != "nan"
+            )
+    finally:
+        if archive is not None:
+            archive.close()
+
+    return sorted(values)
+
+
+# ============================================================
 # SIDEBAR / NAVIGATION
 # ============================================================
 
@@ -1224,7 +1761,7 @@ if st.session_state.get("synchronized_data") is not None:
 else:
     st.sidebar.info("Rainfall–traffic synchronization pending")
 
-st.sidebar.caption("NIQKI Web Application · v1.4.2")
+st.sidebar.caption("NIQKI Web Application · v1.6")
 
 # ============================================================
 # HOME
@@ -1723,9 +2260,10 @@ elif page == "Rainfall Data":
 elif page == "Traffic Data":
     st.title("Traffic Data")
     st.write(
-        "Use this page for either a raw traffic dataset or an existing "
-        "SWMM external pollutant inflow file. These are different inputs "
-        "and are handled separately."
+        "Upload a traffic dataset in CSV, TXT, DAT, Excel or ZIP format. "
+        "The application automatically inspects the structure and lets you "
+        "select the date/time and traffic-count fields. Large delimited files "
+        "are processed in chunks."
     )
 
     st.divider()
@@ -1733,825 +2271,953 @@ elif page == "Traffic Data":
     input_type = st.radio(
         "Input type",
         [
-            "Raw traffic dataset",
+            "Automatic traffic dataset",
             "Existing SWMM pollutant inflow DAT"
         ],
         horizontal=True,
         key="traffic_input_type"
     )
 
-    # --------------------------------------------------------
-    # EXISTING SWMM POLLUTANT INFLOW REFERENCE
-    # --------------------------------------------------------
     if input_type == "Existing SWMM pollutant inflow DAT":
-        st.subheader("1. Upload Existing SWMM Pollutant Inflow")
-
-        st.info(
-            "This is NOT raw traffic data. Use this option for a file such "
-            "as twp_swmm_inflow.dat containing Date, Time and "
-            "Mass_Inflow_(kg/day). The file is treated as an existing "
-            "pollutant-loading reference and is not interpreted as vehicle "
-            "counts."
-        )
+        st.subheader("Upload Existing SWMM Pollutant Inflow")
 
         reference_file = st.file_uploader(
             "Choose an existing SWMM pollutant inflow DAT file",
             type=["dat", "txt", "zip"],
             key="pollutant_reference_uploader",
-            help="A ZIP archive may contain the DAT/TXT pollutant inflow file."
         )
 
         if reference_file is not None:
-            signature = (
-                reference_file.name,
-                reference_file.size
-            )
-
             try:
-                reference_input, reference_extension, reference_source = (
-                    prepare_uploaded_data_file(
-                        reference_file,
-                        "pollutant_zip_member",
-                        "SWMM pollutant inflow"
-                    )
+                reference_input, _, reference_source = prepare_uploaded_data_file(
+                    reference_file,
+                    "pollutant_zip_member",
+                    "SWMM pollutant inflow"
                 )
-
-                reference = read_swmm_external_inflow_file(
-                    reference_input
-                )
-
+                reference = read_swmm_external_inflow_file(reference_input)
                 st.session_state.pollutant_reference_data = reference
-                st.session_state.pollutant_reference_source_info = (
-                    reference_source
-                )
+                st.session_state.pollutant_reference_source_info = reference_source
 
                 st.success(
-                    f"SWMM pollutant inflow file read successfully · "
+                    f"SWMM pollutant inflow read successfully · "
                     f"{len(reference):,} records"
                 )
-
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Records", f"{len(reference):,}")
-                c2.metric(
-                    "Total mass",
-                    f"{reference['Mass Inflow (kg/day)'].sum():,.4f} kg/day"
-                )
-                c3.metric(
-                    "Maximum",
-                    f"{reference['Mass Inflow (kg/day)'].max():,.4f} kg/day"
-                )
-                c4.metric(
-                    "Average",
-                    f"{reference['Mass Inflow (kg/day)'].mean():,.4f} kg/day"
-                )
-
-                st.write(
-                    f"**Period:** "
-                    f"{reference['Date/Time'].min().strftime('%d.%m.%Y %H:%M')} "
-                    f"→ "
-                    f"{reference['Date/Time'].max().strftime('%d.%m.%Y %H:%M')}"
-                )
-
-                st.subheader("2. Existing Pollutant Time Series")
-                st.line_chart(
-                    reference.set_index("Date/Time")[
-                        ["Mass Inflow (kg/day)"]
-                    ]
-                )
-
                 st.dataframe(
                     reference.head(1000),
                     use_container_width=True,
                     hide_index=True
                 )
-
                 st.download_button(
                     "Download parsed pollutant CSV",
-                    data=reference.to_csv(index=False).encode("utf-8"),
-                    file_name="parsed_swmm_pollutant_inflow.csv",
-                    mime="text/csv",
+                    reference.to_csv(index=False).encode("utf-8"),
+                    "parsed_swmm_pollutant_inflow.csv",
+                    "text/csv",
                     key="download_reference_pollutant_csv"
                 )
-
-                st.success(
-                    "Reference pollutant data loaded successfully. "
-                    "It is ready to be used as an existing SWMM pollutant "
-                    "inflow reference."
-                )
-
-                st.warning(
-                    "Because no original traffic dataset or traffic-to-"
-                    "pollutant equation was provided, the application does "
-                    "not reverse-calculate vehicle counts from this file."
-                )
-
             except Exception as exc:
-                st.error(
-                    f"Could not process the SWMM pollutant inflow file: {exc}"
-                )
+                st.error(f"Could not process the pollutant inflow file: {exc}")
 
-    # --------------------------------------------------------
-    # RAW TRAFFIC DATA
-    # --------------------------------------------------------
     else:
         st.subheader("1. Upload Traffic Dataset")
 
         traffic_file = st.file_uploader(
-            "Choose a traffic file",
+            "Choose a traffic dataset",
             type=["csv", "txt", "dat", "xlsx", "xls", "zip"],
-            key="traffic_uploader",
-            help=(
-                "You can upload a single traffic file or a ZIP archive "
-                "containing CSV, TXT, DAT or Excel traffic data."
-            )
+            key="traffic_generic_auto_uploader",
+            help="ZIP files may contain large TXT/CSV/DAT traffic datasets."
         )
 
-        if traffic_file is None:
-            st.info(
-                "Upload the separate raw traffic dataset here. "
-                "You can also upload a ZIP archive containing the traffic file."
-            )
-        else:
+        if traffic_file is not None:
             try:
-                selected_traffic_file, traffic_extension, traffic_source_name = (
-                    prepare_uploaded_data_file(
-                        traffic_file,
-                        "traffic_zip_member",
-                        "traffic"
-                    )
-                )
-            except Exception as exc:
-                st.error(f"Could not read the uploaded traffic archive: {exc}")
-                st.stop()
+                ext = get_extension(traffic_file.name)
 
-            signature = (
-                traffic_file.name,
-                traffic_file.size,
-                traffic_source_name
-            )
-
-            if st.session_state.traffic_file_signature != signature:
-                st.session_state.traffic_data = None
-                st.session_state.traffic_source_info = None
-                st.session_state.pollutant_data = None
-                st.session_state.traffic_file_signature = signature
-
-            try:
-                # Guard against accidentally using the reference inflow file.
-                if traffic_extension in ["dat", "txt"]:
-                    selected_traffic_file.seek(0)
-                    preview_bytes = selected_traffic_file.read(4000)
-                    try:
-                        preview_text = preview_bytes.decode("utf-8")
-                    except UnicodeDecodeError:
-                        preview_text = preview_bytes.decode(
-                            "cp1252", errors="ignore"
-                        )
-
-                    if "external inflow" in preview_text.lower() and (
-                        "mass_inflow" in preview_text.lower()
-                        or "mass inflow" in preview_text.lower()
-                    ):
-                        st.warning(
-                            "This file is an existing SWMM pollutant inflow "
-                            "file, not a raw traffic dataset. Switch the "
-                            "Input type above to **Existing SWMM pollutant "
-                            "inflow DAT**."
-                        )
-                        st.stop()
-
-                sheet_name = None
-
-                if traffic_extension in ["xlsx", "xls"]:
-                    sheets = get_excel_sheets(selected_traffic_file)
+                if ext in ["xlsx", "xls"]:
+                    sheets = get_excel_sheets(traffic_file)
                     sheet_name = st.selectbox(
                         "Excel sheet",
                         sheets,
-                        key="traffic_sheet"
+                        key="traffic_auto_excel_sheet"
                     )
+                    raw_traffic = read_excel_sheet(traffic_file, sheet_name)
+                    columns = [str(c).strip() for c in raw_traffic.columns]
+                    analysis = analyse_traffic_columns(raw_traffic)
 
-                raw_traffic, source_info = read_traffic_file(
-                    selected_traffic_file, sheet_name
-                )
+                    source_info = f"Excel sheet: {sheet_name}"
+                    station_column = None
+                    station_value = None
 
-                st.success(
-                    f"File read successfully · "
-                    f"{len(raw_traffic):,} raw records"
-                )
-
-                if get_extension(traffic_file.name) == "zip":
-                    st.info(
-                        f"ZIP archive selected: **{traffic_file.name}** → "
-                        f"using **{traffic_source_name}**"
-                    )
-
-                analysis = analyse_traffic_columns(raw_traffic)
-
-                st.subheader("2. Column Detection")
-                st.dataframe(
-                    analysis.sort_values(
-                        ["Date Score", "Traffic Score"],
-                        ascending=False
-                    ),
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-                date_suggestion = suggest_traffic_date_column(analysis)
-                count_suggestion = suggest_traffic_count_column(analysis)
-
-                columns = list(raw_traffic.columns)
-
-                date_default = (
-                    columns.index(date_suggestion)
-                    if date_suggestion in columns else 0
-                )
-                count_default = (
-                    columns.index(count_suggestion)
-                    if count_suggestion in columns else 0
-                )
-
-                c1, c2 = st.columns(2)
-
-                with c1:
-                    date_col = st.selectbox(
-                        "Date/time column",
-                        columns,
-                        index=date_default,
-                        key="traffic_date_column"
-                    )
-
-                with c2:
-                    count_col = st.selectbox(
-                        "Traffic-count column",
-                        columns,
-                        index=count_default,
-                        key="traffic_count_column"
-                    )
-
-                traffic = prepare_traffic_data(
-                    raw_traffic, date_col, count_col
-                )
-
-                if traffic.empty:
-                    st.error(
-                        "No valid traffic records could be created. "
-                        "Check the selected date/time and traffic columns."
-                    )
                 else:
-                    st.session_state.traffic_data = traffic
-                    st.session_state.traffic_source_info = source_info
+                    preview_info = traffic_detect_text_source(traffic_file)
+                    separator = preview_info["separator"]
+                    encoding = preview_info["encoding"]
 
-                    summary = traffic_summary(traffic)
+                    if ext == "zip":
+                        st.success(
+                            f"ZIP detected · source file: **{preview_info['member']}**"
+                        )
+                    else:
+                        st.success("Delimited traffic file detected.")
 
-                    st.subheader("3. Traffic Data Quality")
-
-                    q1, q2, q3, q4 = st.columns(4)
-                    q1.metric("Records", f"{summary['records']:,}")
-                    q2.metric(
-                        "Total vehicles",
-                        f"{summary['total_vehicles']:,.0f}"
-                    )
-                    q3.metric(
-                        "Average / record",
-                        f"{summary['average']:,.1f}"
-                    )
-                    q4.metric(
-                        "Maximum / record",
-                        f"{summary['maximum']:,.0f}"
+                    columns = traffic_text_columns(
+                        traffic_file, separator, encoding
                     )
 
-                    st.write(
-                        f"**Period:** "
-                        f"{summary['start'].strftime('%d.%m.%Y %H:%M')} "
-                        f"→ "
-                        f"{summary['end'].strftime('%d.%m.%Y %H:%M')}"
+                    # Read only a small preview for scoring/column selection.
+                    traffic_file.seek(0)
+                    archive_preview = None
+                    if ext == "zip":
+                        archive_preview = zipfile.ZipFile(traffic_file)
+                        member = _zip_member_name(traffic_file)
+                        stream_preview = archive_preview.open(member, "r")
+                    else:
+                        stream_preview = traffic_file
+
+                    try:
+                        preview = pd.read_csv(
+                            stream_preview,
+                            sep=separator,
+                            encoding=encoding,
+                            dtype=str,
+                            nrows=2000,
+                            engine="python",
+                            on_bad_lines="skip"
+                        )
+                    finally:
+                        if archive_preview is not None:
+                            archive_preview.close()
+
+                    preview.columns = [str(c).strip() for c in preview.columns]
+                    analysis = analyse_traffic_columns(preview)
+                    source_info = (
+                        f"{encoding}; separator={repr(separator)}"
+                    )
+                    station_column = None
+                    station_value = None
+
+                st.subheader("2. Automatic Structure Detection")
+
+                is_bast = generic_traffic_is_bast(columns)
+
+                if is_bast:
+                    st.info(
+                        "A BASt/mFUND-style structure was detected. "
+                        "This is treated as one supported traffic format, "
+                        "not as a requirement. You can select the station "
+                        "and the traffic-count field like any other dataset."
                     )
 
-                    st.caption(
-                        f"Source: {source_info}. "
-                        f"Negative traffic counts are clipped to zero."
-                    )
+                    if "Zst" in columns:
+                        station_column = st.selectbox(
+                            "Optional counting-station field",
+                            ["None", "Zst"],
+                            key="traffic_station_column"
+                        )
+                        if station_column == "None":
+                            station_column = None
+                        else:
+                            with st.spinner(
+                                "Finding available station values..."
+                            ):
+                                stations = generic_traffic_station_values(
+                                    traffic_file,
+                                    station_column,
+                                    separator,
+                                    encoding
+                                )
 
-                    st.subheader("4. Traffic Time Series")
-                    chart_data = traffic.set_index("Date/Time")[
-                        ["Traffic Count"]
-                    ]
-                    st.line_chart(chart_data)
+                            if stations:
+                                station_value = st.selectbox(
+                                    "Counting station",
+                                    stations,
+                                    key="traffic_station_value"
+                                )
+                            else:
+                                st.warning(
+                                    "No station values were found; all records "
+                                    "will be considered."
+                                )
+                                station_column = None
 
-                    st.subheader("5. Standardized Traffic Data")
+                if not analysis.empty:
                     st.dataframe(
-                        traffic.head(1000),
+                        analysis.sort_values(
+                            ["Date Score", "Traffic Score"],
+                            ascending=False
+                        ),
                         use_container_width=True,
                         hide_index=True
                     )
 
-                    st.download_button(
-                        "Download standardized traffic CSV",
-                        data=traffic.to_csv(
-                            index=False
-                        ).encode("utf-8"),
-                        file_name="NIQKI_standardized_traffic.csv",
-                        mime="text/csv",
-                        key="download_traffic_csv"
+                columns = list(columns)
+                date_suggestion = suggest_traffic_date_column(analysis)
+                count_suggestion = suggest_traffic_count_column(analysis)
+
+                # For BASt, prefer the real date/hour fields if available.
+                if is_bast and "Datum" in columns:
+                    date_col = "Datum"
+                    date_is_combined = False
+                else:
+                    date_col = st.selectbox(
+                        "Date/time column",
+                        columns,
+                        index=columns.index(date_suggestion)
+                        if date_suggestion in columns else 0,
+                        key="traffic_auto_date_column"
+                    )
+                    date_is_combined = True
+
+                if is_bast:
+                    # BASt date is YYMMDD and Stunde is a separate hour field.
+                    hour_col = st.selectbox(
+                        "Hour column (optional)",
+                        ["None"] + [c for c in columns if c.lower() in {
+                            "stunde", "hour", "hh", "zeit"
+                        }],
+                        key="traffic_auto_hour_column"
+                    )
+                    count_options = [
+                        c for c in columns
+                        if c.lower() in {
+                            "kfz_r1", "kfz_r2", "traffic", "traffic_count",
+                            "vehicles", "vehicle_count"
+                        }
+                    ]
+                    if count_options:
+                        default_count = (
+                            "KFZ_R1"
+                            if "KFZ_R1" in count_options
+                            else count_options[0]
+                        )
+                    else:
+                        default_count = count_suggestion
+
+                    count_col = st.selectbox(
+                        "Traffic-count column",
+                        columns,
+                        index=columns.index(default_count)
+                        if default_count in columns else 0,
+                        key="traffic_auto_count_column"
                     )
 
-                    st.info(
-                        "The raw traffic dataset is kept separate from "
-                        "rainfall. It becomes a pollutant-loading input "
-                        "in the next step."
+                    st.caption(
+                        "For this source, the selected count column is used "
+                        "as supplied. Both directions can be represented by "
+                        "selecting an already aggregated KFZ field or by "
+                        "processing each direction separately."
                     )
+
+                    process_bast_like = st.checkbox(
+                        "Combine KFZ_R1 + KFZ_R2 as total traffic",
+                        value=True,
+                        key="traffic_combine_kfz"
+                    )
+                else:
+                    hour_col = "None"
+                    count_col = st.selectbox(
+                        "Traffic-count column",
+                        columns,
+                        index=columns.index(count_suggestion)
+                        if count_suggestion in columns else 0,
+                        key="traffic_auto_count_column_generic"
+                    )
+                    process_bast_like = False
+
+                process_label = (
+                    "Process selected traffic dataset"
+                )
+
+                if st.button(
+                    process_label,
+                    type="primary",
+                    key="process_traffic_generic"
+                ):
+                    if ext in ["xlsx", "xls"]:
+                        traffic = prepare_traffic_data(
+                            raw_traffic, date_col, count_col
+                        )
+                    elif is_bast:
+                        # Build a generic, memory-safe selected-column processor.
+                        # For YYMMDD + hour, create a combined timestamp from
+                        # only the required columns.
+                        if date_col == "Datum" and hour_col != "None":
+                            # Read selected columns in chunks.
+                            selected_cols = [date_col, hour_col, count_col]
+                            if station_column:
+                                selected_cols.append(station_column)
+
+                            archive = None
+                            try:
+                                if ext == "zip":
+                                    traffic_file.seek(0)
+                                    archive = zipfile.ZipFile(traffic_file)
+                                    member = _zip_member_name(traffic_file)
+                                    stream = archive.open(member, "r")
+                                else:
+                                    traffic_file.seek(0)
+                                    stream = traffic_file
+
+                                parts = []
+                                for chunk in pd.read_csv(
+                                    stream,
+                                    sep=separator,
+                                    encoding=encoding,
+                                    dtype=str,
+                                    usecols=list(dict.fromkeys(selected_cols)),
+                                    chunksize=200_000,
+                                    low_memory=True,
+                                    engine="python",
+                                    on_bad_lines="skip"
+                                ):
+                                    chunk.columns = [
+                                        str(c).strip() for c in chunk.columns
+                                    ]
+
+                                    if station_column and station_value is not None:
+                                        chunk = chunk[
+                                            chunk[station_column].astype(str).str.strip()
+                                            == str(station_value).strip()
+                                        ]
+
+                                    if chunk.empty:
+                                        continue
+
+                                    dates = pd.to_datetime(
+                                        chunk[date_col].astype(str).str.strip(),
+                                        format="%y%m%d",
+                                        errors="coerce"
+                                    )
+                                    hours = pd.to_numeric(
+                                        chunk[hour_col], errors="coerce"
+                                    ).fillna(0).clip(0, 23)
+
+                                    prepared = pd.DataFrame({
+                                        "Date/Time": dates
+                                        + pd.to_timedelta(hours, unit="h"),
+                                        "Traffic Count": pd.to_numeric(
+                                            chunk[count_col], errors="coerce"
+                                        )
+                                    }).dropna(subset=["Date/Time"])
+
+                                    prepared["Traffic Count"] = (
+                                        prepared["Traffic Count"]
+                                        .clip(lower=0)
+                                    )
+
+                                    # Optional sum of the two standard BASt
+                                    # directions when requested and available.
+                                    if (
+                                        process_bast_like
+                                        and count_col == "KFZ_R1"
+                                        and "KFZ_R2" in columns
+                                    ):
+                                        # A separate pass would be needed for R2;
+                                        # do not silently pretend it is included.
+                                        st.warning(
+                                            "KFZ_R1 was selected. The app does not "
+                                            "silently add KFZ_R2 unless both are read. "
+                                            "Select an already combined traffic field "
+                                            "or use KFZ_R1/KFZ_R2 explicitly."
+                                        )
+
+                                    parts.append(prepared)
+
+                                if parts:
+                                    traffic = (
+                                        pd.concat(parts, ignore_index=True)
+                                        .groupby(
+                                            "Date/Time", as_index=False
+                                        )["Traffic Count"]
+                                        .sum()
+                                        .sort_values("Date/Time")
+                                        .reset_index(drop=True)
+                                    )
+                                else:
+                                    traffic = pd.DataFrame(
+                                        columns=["Date/Time", "Traffic Count"]
+                                    )
+                            finally:
+                                if archive is not None:
+                                    archive.close()
+                        else:
+                            traffic = generic_traffic_process(
+                                traffic_file,
+                                date_col,
+                                count_col,
+                                separator,
+                                encoding,
+                                station_column,
+                                station_value
+                            )
+                    else:
+                        traffic = generic_traffic_process(
+                            traffic_file,
+                            date_col,
+                            count_col,
+                            separator,
+                            encoding,
+                            station_column,
+                            station_value
+                        )
+
+                    if traffic.empty:
+                        st.error(
+                            "No valid traffic records could be created. "
+                            "Check the selected columns and station filter."
+                        )
+                    else:
+                        st.session_state.traffic_data = traffic
+                        st.session_state.traffic_source_info = source_info
+
+                        summary = traffic_summary(traffic)
+
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Records", f"{summary['records']:,}")
+                        c2.metric(
+                            "Total vehicles",
+                            f"{summary['total_vehicles']:,.0f}"
+                        )
+                        c3.metric(
+                            "Average / record",
+                            f"{summary['average']:,.1f}"
+                        )
+                        c4.metric(
+                            "Maximum / record",
+                            f"{summary['maximum']:,.0f}"
+                        )
+
+                        st.write(
+                            f"**Period:** "
+                            f"{summary['start']:%d.%m.%Y %H:%M} → "
+                            f"{summary['end']:%d.%m.%Y %H:%M}"
+                        )
+
+                        st.line_chart(
+                            traffic.set_index("Date/Time")[["Traffic Count"]]
+                        )
+
+                        st.dataframe(
+                            traffic.head(1000),
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                        st.download_button(
+                            "Download standardized traffic CSV",
+                            traffic.to_csv(index=False).encode("utf-8"),
+                            "NIQKI_standardized_traffic.csv",
+                            "text/csv",
+                            key="download_generic_traffic_csv"
+                        )
+
+                        st.success(
+                            "Traffic data successfully processed. "
+                            "The dataset is now available for synchronization."
+                        )
 
             except Exception as exc:
                 st.error(
-                    f"Could not process the traffic file: {exc}"
+                    f"Could not inspect/process the traffic file: {exc}"
                 )
 
-# ============================================================
-# POLLUTANT LOADING
-# ============================================================
+
 
 elif page == "Data Synchronization":
-    st.markdown("## Rainfall–Traffic Data Synchronization")
-    st.markdown(
-        "Align rainfall and traffic observations to a common analysis period and "
-        "controlled temporal resolution before pollutant loading."
+    st.title("Rainfall–Traffic Data Synchronization")
+    st.write(
+        "Establish the common analysis period between rainfall and traffic "
+        "before applying the NIQKI TWP buildup/wash-off model."
     )
 
     rainfall_sync = st.session_state.get("rainfall_data")
     traffic_sync = st.session_state.get("traffic_data")
 
     if rainfall_sync is None or rainfall_sync.empty:
-        st.warning("Upload and process a rainfall dataset first.")
+        st.warning("Upload and process rainfall data first.")
     elif traffic_sync is None or traffic_sync.empty:
-        st.warning("Upload and process a raw traffic dataset first.")
+        st.warning("Upload and process traffic data first.")
     else:
         rain = rainfall_sync.copy()
         traf = traffic_sync.copy()
 
         rain["Date/Time"] = pd.to_datetime(rain["Date/Time"], errors="coerce")
-        rain["Rainfall (mm)"] = pd.to_numeric(rain["Rainfall (mm)"], errors="coerce")
+        rain["Rainfall (mm)"] = pd.to_numeric(
+            rain["Rainfall (mm)"], errors="coerce"
+        )
         traf["Date/Time"] = pd.to_datetime(traf["Date/Time"], errors="coerce")
-        traf["Traffic Count"] = pd.to_numeric(traf["Traffic Count"], errors="coerce")
 
         rain = rain.dropna(subset=["Date/Time"]).sort_values("Date/Time")
         traf = traf.dropna(subset=["Date/Time"]).sort_values("Date/Time")
 
         if rain.empty or traf.empty:
-            st.error("One of the datasets does not contain valid date/time records.")
+            st.error("One of the datasets has no valid timestamps.")
         else:
             rain_start, rain_end = rain["Date/Time"].min(), rain["Date/Time"].max()
             traf_start, traf_end = traf["Date/Time"].min(), traf["Date/Time"].max()
 
             overlap_start = max(rain_start, traf_start)
             overlap_end = min(rain_end, traf_end)
-            overlap_exists = overlap_start <= overlap_end
 
-            rain_res, rain_min, rain_irregular = detect_temporal_resolution(
-                rain["Date/Time"]
-            )
-            traf_res, traf_min, traf_irregular = detect_temporal_resolution(
-                traf["Date/Time"]
-            )
+            st.subheader("1. Source Period Comparison")
 
-            st.markdown("### Source dataset periods")
             c1, c2 = st.columns(2)
             with c1:
                 st.markdown("**Rainfall**")
+                st.write(f"{rain_start:%d.%m.%Y %H:%M} → {rain_end:%d.%m.%Y %H:%M}")
                 st.write(f"Records: **{len(rain):,}**")
-                st.write(f"Period: **{rain_start:%d.%m.%Y %H:%M} → {rain_end:%d.%m.%Y %H:%M}**")
-                st.write(f"Detected resolution: **{rain_res or 'Unknown'}**")
             with c2:
                 st.markdown("**Traffic**")
+                st.write(f"{traf_start:%d.%m.%Y %H:%M} → {traf_end:%d.%m.%Y %H:%M}")
                 st.write(f"Records: **{len(traf):,}**")
-                st.write(f"Period: **{traf_start:%d.%m.%Y %H:%M} → {traf_end:%d.%m.%Y %H:%M}**")
-                st.write(f"Detected resolution: **{traf_res or 'Unknown'}**")
 
-            if not overlap_exists:
+            if overlap_start > overlap_end:
                 st.error(
-                    "No common time period exists between the rainfall and traffic datasets. "
-                    "They cannot be synchronized without changing the source periods."
+                    "There is no common analysis period. The rainfall and traffic "
+                    "datasets cannot be synchronized as supplied."
                 )
             else:
-                overlap_days = (overlap_end - overlap_start).total_seconds() / 86400.0
+                overlap_days = (
+                    overlap_end - overlap_start
+                ).total_seconds() / 86400.0
 
-                st.markdown("### Synchronization check")
-                s1, s2, s3, s4 = st.columns(4)
-                with s1:
-                    st.metric("Common period", f"{overlap_days:.1f} days")
-                with s2:
-                    st.metric("Overlap start", overlap_start.strftime("%d.%m.%Y"))
-                with s3:
-                    st.metric("Overlap end", overlap_end.strftime("%d.%m.%Y"))
-                with s4:
-                    if rain_min and traf_min:
-                        st.metric(
-                            "Resolution",
-                            "Compatible" if abs(rain_min - traf_min) < 1e-9 else "Different"
+                st.success(
+                    f"Common analysis period found: **{overlap_start:%d.%m.%Y} → "
+                    f"{overlap_end:%d.%m.%Y} ({overlap_days:.1f} days)**"
+                )
+
+                st.subheader("2. Daily Synchronization")
+
+                st.info(
+                    "The original NIQKI traffic-to-TWP model is a daily model: "
+                    "BASt hourly traffic observations are aggregated to daily "
+                    "vehicle totals, while rainfall is aggregated to daily rainfall "
+                    "depth before the buildup/wash-off calculation."
+                )
+
+                # Always use daily rainfall for compatibility with the original model.
+                rain_common = rain[
+                    (rain["Date/Time"] >= overlap_start) &
+                    (rain["Date/Time"] <= overlap_end)
+                ].copy()
+                traf_common = traf[
+                    (traf["Date/Time"] >= overlap_start) &
+                    (traf["Date/Time"] <= overlap_end)
+                ].copy()
+
+                rain_daily = (
+                    rain_common.assign(
+                        Date=pd.to_datetime(rain_common["Date/Time"]).dt.normalize()
+                    )
+                    .groupby("Date", as_index=False)["Rainfall (mm)"]
+                    .sum(min_count=1)
+                    .rename(columns={"Date": "Date/Time"})
+                )
+
+                traffic_cols = [
+                    c for c in
+                    ["Traffic Count", "PKW_Van", "LKW", "Bus"]
+                    if c in traf_common.columns
+                ]
+
+                if not traffic_cols:
+                    traf_daily = (
+                        traf_common.assign(
+                            Date=pd.to_datetime(traf_common["Date/Time"]).dt.normalize()
                         )
-                    else:
-                        st.metric("Resolution", "Review")
-
-                if rain_min and traf_min and abs(rain_min - traf_min) < 1e-9:
-                    st.success("Rainfall and traffic have compatible detected recording intervals.")
-                elif rain_min and traf_min:
-                    st.info(
-                        "The source resolutions differ. The finer dataset will be aggregated "
-                        "to the selected common interval."
-                    )
-                else:
-                    st.warning(
-                        "At least one source has an unknown or irregular resolution. "
-                        "Review the synchronized output carefully."
-                    )
-
-                def _label_minutes(minutes):
-                    if minutes >= 1440 and abs(minutes / 1440 - round(minutes / 1440)) < 1e-9:
-                        days = int(round(minutes / 1440))
-                        return f"{days} day" if days == 1 else f"{days} days"
-                    if minutes >= 60 and abs(minutes / 60 - round(minutes / 60)) < 1e-9:
-                        hours = int(round(minutes / 60))
-                        return f"{hours} hour" if hours == 1 else f"{hours} hours"
-                    return f"{int(minutes)} minutes"
-
-                common_default = max(rain_min, traf_min) if rain_min and traf_min else (rain_min or traf_min or 1440.0)
-
-                options = []
-                if rain_min:
-                    options.append(("rainfall", rain_min, f"Rainfall interval ({_label_minutes(rain_min)})"))
-                if traf_min and not any(abs(traf_min - x[1]) < 1e-9 for x in options):
-                    options.append(("traffic", traf_min, f"Traffic interval ({_label_minutes(traf_min)})"))
-                if rain_min and traf_min and abs(rain_min - traf_min) > 1e-9:
-                    options.append(("coarser", max(rain_min, traf_min),
-                                    f"Recommended common interval ({_label_minutes(max(rain_min, traf_min))})"))
-                options.append(("custom", None, "Custom interval"))
-
-                labels = [x[2] for x in options]
-                default_index = next(
-                    (i for i, x in enumerate(options)
-                     if x[0] == "coarser" or (x[1] is not None and abs(x[1] - common_default) < 1e-9)),
-                    0
-                )
-
-                selected_label = st.selectbox(
-                    "Synchronization interval",
-                    labels,
-                    index=default_index,
-                    key="sync_interval_choice"
-                )
-                selected_kind, selected_minutes, _ = options[labels.index(selected_label)]
-
-                if selected_kind == "custom":
-                    selected_minutes = st.number_input(
-                        "Custom interval (minutes)",
-                        min_value=1.0,
-                        value=float(common_default),
-                        step=1.0,
-                        key="sync_custom_minutes"
-                    )
-
-                traffic_mode = st.selectbox(
-                    "Traffic variable interpretation",
-                    [
-                        "Counts per recording interval (sum when aggregating)",
-                        "Rate (vehicles/hour; average when aggregating)",
-                    ],
-                    help=(
-                        "Choose counts when each record is a vehicle total for its interval. "
-                        "Choose rate when values represent vehicles/hour."
-                    ),
-                    key="sync_traffic_mode"
-                )
-
-                st.caption(
-                    "Rainfall is always aggregated by summing interval depths. Traffic is "
-                    "summed for interval counts or averaged for rates."
-                )
-
-                if selected_minutes and selected_minutes > 0:
-                    freq = f"{int(selected_minutes)}min"
-
-                    rain_common = rain[
-                        (rain["Date/Time"] >= overlap_start) &
-                        (rain["Date/Time"] <= overlap_end)
-                    ].copy()
-                    traf_common = traf[
-                        (traf["Date/Time"] >= overlap_start) &
-                        (traf["Date/Time"] <= overlap_end)
-                    ].copy()
-
-                    rain_common = (
-                        rain_common.set_index("Date/Time")["Rainfall (mm)"]
-                        .resample(freq)
+                        .groupby("Date", as_index=False)["Traffic Count"]
                         .sum(min_count=1)
-                        .rename("Rainfall (mm)")
-                        .reset_index()
+                        .rename(columns={"Date": "Date/Time"})
                     )
-
-                    traffic_series = traf_common.set_index("Date/Time")["Traffic Count"]
-                    if traffic_mode.startswith("Counts"):
-                        traffic_series = traffic_series.resample(freq).sum(min_count=1)
-                    else:
-                        traffic_series = traffic_series.resample(freq).mean()
-                    traf_common = traffic_series.rename("Traffic Count").reset_index()
-
-                    synchronized = pd.merge(
-                        rain_common, traf_common, on="Date/Time", how="outer"
-                    ).sort_values("Date/Time")
-
-                    # Keep bins that actually intersect the source overlap.
-                    bin_end = synchronized["Date/Time"] + pd.to_timedelta(
-                        float(selected_minutes), unit="m"
-                    )
-                    synchronized = synchronized[
-                        (synchronized["Date/Time"] <= overlap_end) &
-                        (bin_end > overlap_start)
-                    ].copy()
-
-                    rain_missing = int(synchronized["Rainfall (mm)"].isna().sum())
-                    traffic_missing = int(synchronized["Traffic Count"].isna().sum())
-
-                    st.markdown("### Synchronization result")
-                    r1, r2, r3, r4 = st.columns(4)
-                    with r1:
-                        st.metric("Synchronized records", f"{len(synchronized):,}")
-                    with r2:
-                        st.metric("Rainfall gaps", f"{rain_missing:,}")
-                    with r3:
-                        st.metric("Traffic gaps", f"{traffic_missing:,}")
-                    with r4:
-                        st.metric("Common interval", _label_minutes(float(selected_minutes)))
-
-                    if len(synchronized) == 0:
-                        st.error("No synchronized records were produced.")
-                    else:
-                        if rain_missing == 0 and traffic_missing == 0:
-                            st.success("Synchronization completed with no missing aligned values.")
-                        else:
-                            st.warning(
-                                "Synchronization completed with missing aligned values. "
-                                "Missing values are not automatically converted to zero."
-                            )
-
-                        st.dataframe(
-                            synchronized.head(100),
-                            use_container_width=True,
-                            hide_index=True
-                        )
-                        if len(synchronized) > 100:
-                            st.caption("Showing the first 100 synchronized records.")
-
-                        st.session_state.synchronized_data = synchronized
-                        st.session_state.sync_summary = {
-                            "rainfall_start": rain_start,
-                            "rainfall_end": rain_end,
-                            "traffic_start": traf_start,
-                            "traffic_end": traf_end,
-                            "overlap_start": overlap_start,
-                            "overlap_end": overlap_end,
-                            "overlap_days": overlap_days,
-                            "rainfall_resolution": rain_res,
-                            "traffic_resolution": traf_res,
-                            "sync_interval_minutes": float(selected_minutes),
-                            "traffic_mode": traffic_mode,
-                            "records": len(synchronized),
-                            "rainfall_missing": rain_missing,
-                            "traffic_missing": traffic_missing,
-                        }
-
-                        st.download_button(
-                            "Download synchronized CSV",
-                            data=synchronized.to_csv(index=False).encode("utf-8"),
-                            file_name="NIQKI_synchronized_rainfall_traffic.csv",
-                            mime="text/csv",
-                            key="download_synchronized_csv"
-                        )
-
-                        st.info(
-                            "The synchronized dataset is ready for pollutant-loading analysis. "
-                            "No emission factor or pollutant calculation is applied on this page."
-                        )
                 else:
-                    st.error("Synchronization interval must be greater than zero.")
+                    traf_daily = (
+                        traf_common.assign(
+                            Date=pd.to_datetime(traf_common["Date/Time"]).dt.normalize()
+                        )
+                        .groupby("Date", as_index=False)[traffic_cols]
+                        .sum(min_count=1)
+                        .rename(columns={"Date": "Date/Time"})
+                    )
+
+                synchronized = pd.merge(
+                    rain_daily,
+                    traf_daily,
+                    on="Date/Time",
+                    how="inner"
+                ).sort_values("Date/Time").reset_index(drop=True)
+
+                missing_rain = int(synchronized["Rainfall (mm)"].isna().sum())
+                traffic_count_missing = (
+                    int(synchronized["Traffic Count"].isna().sum())
+                    if "Traffic Count" in synchronized.columns else 0
+                )
+
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("Common days", f"{len(synchronized):,}")
+                r2.metric("Start", synchronized["Date/Time"].min().strftime("%d.%m.%Y") if not synchronized.empty else "—")
+                r3.metric("End", synchronized["Date/Time"].max().strftime("%d.%m.%Y") if not synchronized.empty else "—")
+                r4.metric("Missing aligned values", f"{missing_rain + traffic_count_missing:,}")
+
+                if synchronized.empty:
+                    st.error("No common daily records were produced.")
+                else:
+                    st.dataframe(
+                        synchronized.head(1000),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    st.session_state.synchronized_data = synchronized
+                    st.session_state.sync_summary = {
+                        "overlap_start": overlap_start,
+                        "overlap_end": overlap_end,
+                        "overlap_days": overlap_days,
+                        "records": len(synchronized),
+                        "mode": "Daily — original NIQKI TWP model compatibility"
+                    }
+
+                    st.download_button(
+                        "Download synchronized rainfall–traffic CSV",
+                        synchronized.to_csv(index=False).encode("utf-8"),
+                        "NIQKI_synchronized_rainfall_traffic_daily.csv",
+                        "text/csv",
+                        key="download_synchronized_daily_csv"
+                    )
+
+                    st.success(
+                        "Daily synchronization is complete. The synchronized dataset "
+                        "is ready for the original NIQKI TWP buildup/wash-off model."
+                    )
+
+
 
 elif page == "Pollutant Loading":
     st.title("Pollutant Loading")
     st.write(
-        "Convert the standardized traffic time series into a pollutant "
-        "mass-inflow time series suitable for preparation as an SWMM "
-        "external inflow file."
+        "Convert the synchronized traffic dataset into pollutant mass loading. "
+        "The calculation is generic: emission factors, road length and model "
+        "parameters are user-configurable rather than tied to one traffic provider."
     )
 
-    if (
-        st.session_state.traffic_data is None
-        and st.session_state.pollutant_reference_data is not None
-    ):
-        reference = st.session_state.pollutant_reference_data.copy()
+    traffic = st.session_state.get("traffic_data")
+    rainfall = st.session_state.get("rainfall_data")
+    synchronized = st.session_state.get("synchronized_data")
 
-        st.info(
-            "An existing SWMM pollutant inflow reference is loaded. "
-            "This can be inspected and exported here, but it is not "
-            "treated as raw traffic data."
-        )
-
-        st.subheader("1. Existing SWMM Pollutant Inflow")
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Records", f"{len(reference):,}")
-        c2.metric(
-            "Total mass",
-            f"{reference['Mass Inflow (kg/day)'].sum():,.4f} kg/day"
-        )
-        c3.metric(
-            "Maximum",
-            f"{reference['Mass Inflow (kg/day)'].max():,.4f} kg/day"
-        )
-
-        st.line_chart(
-            reference.set_index("Date/Time")[
-                ["Mass Inflow (kg/day)"]
-            ]
-        )
-
-        st.dataframe(
-            reference.head(1000),
-            use_container_width=True,
-            hide_index=True
-        )
-
-        dat_text = generate_swmm_inflow_dat(
-            reference,
-            title="Existing SWMM Pollutant Inflow Reference"
-        )
-
-        st.subheader("2. SWMM External Inflow DAT Preview")
-        st.code(
-            "\n".join(dat_text.splitlines()[:15]),
-            language="text"
-        )
-
-        st.download_button(
-            "Download SWMM pollutant inflow DAT",
-            data=dat_text.encode("utf-8"),
-            file_name="twp_swmm_inflow_reference.dat",
-            mime="text/plain",
-            key="download_reference_pollutant_dat"
-        )
-
-        st.warning(
-            "The original traffic-to-pollutant calculation that produced "
-            "this reference file is unknown. Do not use it to infer a "
-            "traffic emission factor unless that methodology is documented."
-        )
-
-    elif st.session_state.traffic_data is None:
-        st.warning(
-            "No traffic dataset is loaded. Go to **Traffic Data** first."
-        )
+    if traffic is None or traffic.empty:
+        st.warning("Upload and process traffic data first.")
+    elif rainfall is None or rainfall.empty:
+        st.warning("Upload and process rainfall data first.")
     else:
-        traffic = st.session_state.traffic_data.copy()
+        st.subheader("1. Traffic-to-Pollutant Parameters")
 
-        st.subheader("1. Pollutant Loading Parameters")
-
-        st.warning(
-            "The original traffic-to-pollutant calculation behind the "
-            "reference SWMM inflow file was not provided. Therefore, this "
-            "page does not claim a source-specific emission factor. "
-            "Enter the emission factor required by your chosen "
-            "NIQKI/literature methodology."
+        method = st.radio(
+            "Calculation method",
+            [
+                "Generic traffic emission factor",
+                "Vehicle-class emission factors"
+            ],
+            horizontal=True,
+            key="pollutant_method"
         )
 
-        c1, c2 = st.columns(2)
+        road_length = st.number_input(
+            "Road segment length (km)",
+            min_value=0.1,
+            max_value=100.0,
+            value=2.0,
+            step=0.1,
+            key="generic_road_length"
+        )
 
-        with c1:
+        if method == "Generic traffic emission factor":
             emission_factor = st.number_input(
-                "Emission factor (g pollutant / vehicle / day)",
+                "Emission factor (g pollutant / vehicle / km)",
                 min_value=0.0,
-                value=1.0,
+                value=0.09,
                 step=0.01,
-                format="%.4f",
-                help=(
-                    "Use the value specified by your project methodology "
-                    "or literature source."
-                )
+                key="generic_emission_factor"
             )
-
-        with c2:
-            scale_factor = st.number_input(
-                "Scenario scale factor",
+            driving_factor = st.number_input(
+                "Driving dynamics factor",
                 min_value=0.0,
-                value=1.0,
-                step=0.1,
-                format="%.4f",
-                help=(
-                    "Optional multiplicative scenario factor. "
-                    "Keep at 1.0 unless your methodology specifies otherwise."
+                value=1.3,
+                step=0.05,
+                key="generic_driving_factor"
+            )
+            surface_factor = st.number_input(
+                "Road surface factor",
+                min_value=0.0,
+                value=1.1,
+                step=0.05,
+                key="generic_surface_factor"
+            )
+
+            st.latex(
+                r"M_{\mathrm{generation}}="
+                r"\frac{N_{\mathrm{vehicles}}\;EF\;L\;"
+                r"K_{\mathrm{drive}}\;K_{\mathrm{road}}}{1000}"
+            )
+
+            if st.button(
+                "Calculate pollutant generation",
+                type="primary",
+                key="calculate_generic_pollutant"
+            ):
+                calc = traffic.copy()
+                calc["Traffic Count"] = pd.to_numeric(
+                    calc["Traffic Count"], errors="coerce"
+                ).fillna(0).clip(lower=0)
+
+                calc["M_gen_daily_kg"] = (
+                    calc["Traffic Count"]
+                    * float(emission_factor)
+                    * float(road_length)
+                    * float(driving_factor)
+                    * float(surface_factor)
+                    / 1000.0
                 )
+
+                traffic_daily = (
+                    calc.assign(
+                        Date=calc["Date/Time"].dt.normalize()
+                    )
+                    .groupby("Date", as_index=False)["M_gen_daily_kg"]
+                    .sum()
+                    .rename(columns={"Date": "Date/Time"})
+                )
+
+        else:
+            if not all(
+                c in traffic.columns
+                for c in ["PKW_Van", "LKW", "Bus"]
+            ):
+                st.warning(
+                    "Vehicle-class fields are not present in this traffic dataset. "
+                    "Use the generic emission-factor method, or upload a dataset "
+                    "that contains separate vehicle classes."
+                )
+                traffic_daily = None
+            else:
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    ef_pkw = st.number_input(
+                        "PKW/LFW (mg/veh/km)",
+                        min_value=0.0, value=90.0, step=1.0,
+                        key="class_ef_pkw"
+                    )
+                with c2:
+                    ef_lkw = st.number_input(
+                        "LKW/LZG/SAT (mg/veh/km)",
+                        min_value=0.0, value=800.0, step=10.0,
+                        key="class_ef_lkw"
+                    )
+                with c3:
+                    ef_bus = st.number_input(
+                        "Bus (mg/veh/km)",
+                        min_value=0.0, value=700.0, step=10.0,
+                        key="class_ef_bus"
+                    )
+
+                driving_factor = st.number_input(
+                    "Driving dynamics factor",
+                    min_value=0.0, value=1.3, step=0.05,
+                    key="class_driving_factor"
+                )
+                surface_factor = st.number_input(
+                    "Road surface factor",
+                    min_value=0.0, value=1.1, step=0.05,
+                    key="class_surface_factor"
+                )
+
+                st.latex(
+                    r"M_{\mathrm{generation}}="
+                    r"\frac{(N_{PKW/LFW}EF_{PKW}"
+                    r"+N_{LKW/LZG/SAT}EF_{LKW}"
+                    r"+N_{Bus}EF_{Bus})LK_{drive}K_{road}}{10^6}"
+                )
+
+                if st.button(
+                    "Calculate pollutant generation",
+                    type="primary",
+                    key="calculate_class_pollutant"
+                ):
+                    calc = traffic.copy()
+                    for col in ["PKW_Van", "LKW", "Bus"]:
+                        calc[col] = pd.to_numeric(
+                            calc[col], errors="coerce"
+                        ).fillna(0).clip(lower=0)
+
+                    calc["M_generation"] = (
+                        (
+                            calc["PKW_Van"] * float(ef_pkw)
+                            + calc["LKW"] * float(ef_lkw)
+                            + calc["Bus"] * float(ef_bus)
+                        )
+                        * float(road_length)
+                        * float(driving_factor)
+                        * float(surface_factor)
+                        / 1e6
+                    )
+
+                    traffic_daily = (
+                        calc.assign(
+                            Date=calc["Date/Time"].dt.normalize()
+                        )
+                        .groupby("Date", as_index=False)["M_generation"]
+                        .sum()
+                        .rename(
+                            columns={
+                                "Date": "Date/Time",
+                                "M_generation": "M_gen_daily_kg"
+                            }
+                        )
+                    )
+
+        if "traffic_daily" in locals() and traffic_daily is not None and not traffic_daily.empty:
+            # Daily rainfall, then common date intersection.
+            rain = rainfall.copy()
+            rain["Date/Time"] = pd.to_datetime(
+                rain["Date/Time"], errors="coerce"
+            )
+            rain["Rainfall (mm)"] = pd.to_numeric(
+                rain["Rainfall (mm)"], errors="coerce"
+            ).fillna(0.0)
+
+            rain_daily = (
+                rain.assign(
+                    Date=rain["Date/Time"].dt.normalize()
+                )
+                .groupby("Date", as_index=False)["Rainfall (mm)"]
+                .sum()
+                .rename(columns={"Date": "Date/Time"})
             )
 
-        st.markdown("### Calculation")
+            df_sim = pd.merge(
+                rain_daily,
+                traffic_daily,
+                on="Date/Time",
+                how="inner"
+            ).sort_values("Date/Time").reset_index(drop=True)
 
-        st.latex(
-            r"M_{\mathrm{pollutant}}"
-            r"=\frac{N_{\mathrm{vehicles}}\times EF\times S}{1000}"
-        )
+            if df_sim.empty:
+                st.error(
+                    "Rainfall and traffic do not share a common daily period."
+                )
+            else:
+                st.subheader("2. Buildup / Wash-off Parameters")
 
-        st.caption(
-            "M = pollutant mass [kg/day]; N = traffic count [vehicles/day]; "
-            "EF = emission factor [g/vehicle/day]; S = scenario scale factor."
-        )
+                b1, b2, b3 = st.columns(3)
+                with b1:
+                    k_loss = st.number_input(
+                        "Buildup loss rate k_loss (1/day)",
+                        min_value=0.0001, value=0.05, step=0.005,
+                        key="generic_k_loss"
+                    )
+                    c1_washoff = st.number_input(
+                        "Wash-off coefficient C1",
+                        min_value=0.0, value=0.05, step=0.01,
+                        key="generic_c1"
+                    )
+                with b2:
+                    c2_washoff = st.number_input(
+                        "Wash-off exponent C2",
+                        min_value=0.0, value=1.3, step=0.1,
+                        key="generic_c2"
+                    )
+                    eta_verge = st.number_input(
+                        "Verge retention η",
+                        min_value=0.0, max_value=1.0,
+                        value=0.40, step=0.05,
+                        key="generic_eta_verge"
+                    )
+                with b3:
+                    eta_trap = st.number_input(
+                        "Gully/trap retention η",
+                        min_value=0.0, max_value=1.0,
+                        value=0.30, step=0.05,
+                        key="generic_eta_trap"
+                    )
 
-        if st.button(
-            "Calculate pollutant loading",
-            type="primary",
-            key="calculate_pollutant_loading"
-        ):
-            pollutant = calculate_pollutant_loading(
-                traffic,
-                emission_factor,
-                scale_factor
-            )
+                result = bast_daily_washoff(
+                    df_sim,
+                    k_loss=k_loss,
+                    c1_washoff=c1_washoff,
+                    c2_washoff=c2_washoff,
+                    eta_verge=eta_verge,
+                    eta_trap=eta_trap
+                )
 
-            st.session_state.pollutant_data = pollutant
-            st.session_state.traffic_parameters = {
-                "emission_factor_g_per_vehicle_day": emission_factor,
-                "scale_factor": scale_factor
-            }
+                st.session_state.pollutant_data = result
+                st.session_state.traffic_parameters = {
+                    "method": method,
+                    "road_length_km": float(road_length),
+                    "k_loss": float(k_loss),
+                    "C1_washoff": float(c1_washoff),
+                    "C2_washoff": float(c2_washoff),
+                    "eta_verge": float(eta_verge),
+                    "eta_trap": float(eta_trap)
+                }
 
-        if st.session_state.pollutant_data is not None:
-            pollutant = st.session_state.pollutant_data.copy()
+                st.subheader("3. Results")
 
-            st.subheader("2. Pollutant Loading Results")
+                total_generated = float(
+                    result["M_gen_daily_kg"].sum()
+                )
+                total_sewer = float(
+                    result["Sewer_Mass_kg"].sum()
+                )
 
-            total_mass = float(
-                pollutant["Mass Inflow (kg/day)"].sum()
-            )
-            maximum_mass = float(
-                pollutant["Mass Inflow (kg/day)"].max()
-            )
-            average_mass = float(
-                pollutant["Mass Inflow (kg/day)"].mean()
-            )
+                c1, c2, c3 = st.columns(3)
+                c1.metric(
+                    "Total generated pollutant",
+                    f"{total_generated:,.4f} kg"
+                )
+                c2.metric(
+                    "Total sewer discharge",
+                    f"{total_sewer:,.4f} kg"
+                )
+                c3.metric(
+                    "Maximum daily sewer mass",
+                    f"{result['Sewer_Mass_kg'].max():,.4f} kg/day"
+                )
 
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total mass", f"{total_mass:,.4f} kg")
-            c2.metric("Average mass", f"{average_mass:,.4f} kg/day")
-            c3.metric("Maximum", f"{maximum_mass:,.4f} kg/day")
+                st.dataframe(
+                    result.head(1000),
+                    use_container_width=True,
+                    hide_index=True
+                )
 
-            chart = pollutant.set_index("Date/Time")[
-                ["Mass Inflow (kg/day)"]
-            ]
-            st.line_chart(chart)
+                st.download_button(
+                    "Download pollutant results CSV",
+                    result.to_csv(index=False).encode("utf-8"),
+                    "NIQKI_pollutant_loading_results.csv",
+                    "text/csv",
+                    key="download_generic_pollutant_results"
+                )
 
-            st.dataframe(
-                pollutant.head(1000),
-                use_container_width=True,
-                hide_index=True
-            )
+                dat_df = result[
+                    ["Date/Time", "Sewer_Mass_kg"]
+                ].rename(
+                    columns={"Sewer_Mass_kg": "Mass Inflow (kg/day)"}
+                )
 
-            csv_bytes = pollutant.to_csv(
-                index=False
-            ).encode("utf-8")
+                dat_text = generate_swmm_inflow_dat(
+                    dat_df,
+                    title="NIQKI generic traffic pollutant loading"
+                )
 
-            st.download_button(
-                "Download pollutant time series CSV",
-                data=csv_bytes,
-                file_name="NIQKI_pollutant_time_series.csv",
-                mime="text/csv",
-                key="download_pollutant_csv"
-            )
+                st.subheader("4. SWMM Pollutant Inflow DAT")
+                st.code(
+                    "\n".join(dat_text.splitlines()[:15]),
+                    language="text"
+                )
+                st.download_button(
+                    "Download pollutant SWMM inflow DAT",
+                    dat_text.encode("utf-8"),
+                    "twp_swmm_inflow.dat",
+                    "text/plain",
+                    key="download_generic_pollutant_dat"
+                )
 
-            st.subheader("3. SWMM External Inflow File")
 
-            dat_text = generate_swmm_inflow_dat(
-                pollutant,
-                title="NIQKI Traffic-Based Pollutant Loading"
-            )
-
-            st.code(
-                "\n".join(dat_text.splitlines()[:15]),
-                language="text"
-            )
-
-            st.download_button(
-                "Download SWMM pollutant inflow DAT",
-                data=dat_text.encode("utf-8"),
-                file_name="twp_swmm_inflow.dat",
-                mime="text/plain",
-                key="download_pollutant_dat"
-            )
-
-            st.info(
-                "This DAT file is a pollutant mass-inflow time series. "
-                "It is separate from the rainfall Rain Gage DAT file. "
-                "The pollutant object/inflow configuration in EPA SWMM "
-                "must reference the correct time series according to your "
-                "SWMM model setup."
-            )
-
-# ============================================================
-# MODEL PARAMETERS
-# ============================================================
 
 elif page == "Model Parameters":
     st.title("Mathematical Model Parameters")
