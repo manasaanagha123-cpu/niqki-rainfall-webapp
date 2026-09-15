@@ -1733,6 +1733,7 @@ page = st.sidebar.radio(
     "APPLICATION",
     [
         "Home",
+        "Methodology",
         "Rainfall Data",
         "Traffic Data",
         "Data Synchronization",
@@ -1761,7 +1762,7 @@ if st.session_state.get("synchronized_data") is not None:
 else:
     st.sidebar.info("Rainfall–traffic synchronization pending")
 
-st.sidebar.caption("NIQKI Web Application · v1.6")
+st.sidebar.caption("NIQKI Web Application · v2.0")
 
 # ============================================================
 # HOME
@@ -1834,6 +1835,489 @@ if page == "Home":
 # ============================================================
 # RAINFALL DATA
 # ============================================================
+
+
+elif page == "Methodology":
+    st.title("NIQKI Methodology")
+    st.write(
+        "This page documents the engineering workflow implemented in the "
+        "NIQKI application. It describes how rainfall and traffic data are "
+        "prepared, synchronized, used for pollutant loading calculations, "
+        "and converted into external inputs for EPA SWMM."
+    )
+
+    st.divider()
+
+    # ------------------------------------------------------------
+    # 1. PROJECT OBJECTIVE
+    # ------------------------------------------------------------
+    st.header("1. Project Objective")
+    st.write(
+        "The NIQKI application provides a structured workflow for analysing "
+        "rainfall and traffic data and preparing model inputs for runoff and "
+        "road-related pollutant investigations. The application separates "
+        "data preparation, quality control, temporal synchronization, "
+        "pollutant loading and SWMM input preparation."
+    )
+
+    st.info(
+        "The application is designed to be data-source independent. "
+        "BASt/mFUND is one supported traffic-data structure; it is not a "
+        "requirement of the overall workflow."
+    )
+
+    # ------------------------------------------------------------
+    # 2. INPUT DATA
+    # ------------------------------------------------------------
+    st.header("2. Input Data")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Rainfall data")
+        st.markdown(
+            """
+            - Date/time
+            - Rainfall depth
+            - Recording interval
+            - Station information, where available
+            - Optional metadata
+            """
+        )
+    with c2:
+        st.subheader("Traffic data")
+        st.markdown(
+            """
+            - Date/time
+            - Traffic volume
+            - Optional vehicle classes
+            - Optional station/location identifier
+            - Optional road-segment information
+            """
+        )
+
+    st.caption(
+        "Supported source formats are handled through the Rainfall Data and "
+        "Traffic Data modules. ZIP archives can contain the source data file."
+    )
+
+    # ------------------------------------------------------------
+    # 3. RAINFALL PROCESSING
+    # ------------------------------------------------------------
+    st.header("3. Rainfall Data Processing")
+
+    st.markdown(
+        """
+        The rainfall workflow converts heterogeneous source files into a
+        standardized time series with the following core fields:
+
+        **Date/Time** and **Rainfall (mm)**.
+        """
+    )
+
+    st.markdown(
+        """
+        **Processing sequence**
+
+        1. Upload rainfall data.
+        2. Detect file encoding and separator where applicable.
+        3. Identify metadata/header rows.
+        4. Detect date/time and rainfall columns.
+        5. Convert date/time values to a consistent timestamp format.
+        6. Convert rainfall values to numeric values.
+        7. Check missing, negative and invalid observations.
+        8. Standardize the dataset for subsequent analysis.
+        """
+    )
+
+    st.latex(r"R_{\mathrm{total}}=\sum_{i=1}^{n} R_i")
+
+    st.caption(
+        "Rainfall totals are calculated from the standardized rainfall "
+        "observations. Missing observations are not automatically assumed "
+        "to represent zero rainfall."
+    )
+
+    # ------------------------------------------------------------
+    # 4. RAINFALL EVENT ANALYSIS
+    # ------------------------------------------------------------
+    st.header("4. Rainfall Event Analysis")
+
+    st.write(
+        "Rainfall events are identified from consecutive rainfall observations "
+        "using a dry-period threshold. The threshold is selected with respect "
+        "to the temporal resolution of the rainfall dataset."
+    )
+
+    st.markdown(
+        """
+        An event is characterized by:
+
+        - Event start
+        - Event end
+        - Event duration
+        - Total event rainfall
+        - Maximum interval rainfall
+        - Interval-average intensity
+        - Number of rainfall records
+        - Antecedent dry period
+        """
+    )
+
+    st.info(
+        "Event separation is resolution-aware. For example, daily rainfall "
+        "data require a different interpretation of dry periods than "
+        "minute-resolution rainfall data."
+    )
+
+    # ------------------------------------------------------------
+    # 5. TRAFFIC PROCESSING
+    # ------------------------------------------------------------
+    st.header("5. Traffic Data Processing")
+
+    st.write(
+        "Traffic data are processed independently from rainfall. The "
+        "application detects the structure of the uploaded dataset and "
+        "standardizes the available traffic information."
+    )
+
+    st.markdown(
+        """
+        **Generic workflow**
+
+        1. Upload the traffic dataset.
+        2. Detect or select the date/time field.
+        3. Detect or select the traffic-volume field.
+        4. Identify optional vehicle-class or station fields.
+        5. Convert traffic values to numeric values.
+        6. Validate timestamps and traffic values.
+        7. Create the standardized traffic time series.
+        """
+    )
+
+    st.info(
+        "When vehicle-class information is available, the pollutant-loading "
+        "module can use class-specific emission factors. When it is not "
+        "available, a generic traffic-based scenario can be used."
+    )
+
+    # ------------------------------------------------------------
+    # 6. RAINFALL–TRAFFIC SYNCHRONIZATION
+    # ------------------------------------------------------------
+    st.header("6. Rainfall–Traffic Time Synchronization")
+
+    st.write(
+        "Rainfall and traffic datasets must be compared over a common "
+        "analysis period before they are combined. The application therefore "
+        "identifies the temporal overlap between the two datasets."
+    )
+
+    st.markdown(
+        """
+        **Synchronization sequence**
+
+        1. Determine rainfall start and end timestamps.
+        2. Determine traffic start and end timestamps.
+        3. Calculate the common overlap period.
+        4. Compare temporal resolutions.
+        5. Aggregate the datasets to a compatible analysis interval.
+        6. Create the synchronized rainfall–traffic dataset.
+        7. Report missing aligned values and the final analysis period.
+        """
+    )
+
+    st.latex(
+        r"t_{\mathrm{start,common}}="
+        r"\max(t_{\mathrm{start,rain}},t_{\mathrm{start,traffic}})"
+    )
+    st.latex(
+        r"t_{\mathrm{end,common}}="
+        r"\min(t_{\mathrm{end,rain}},t_{\mathrm{end,traffic}})"
+    )
+
+    st.warning(
+        "The synchronized period is based on the actual overlap of the "
+        "uploaded datasets. The application does not silently extend one "
+        "dataset beyond the period covered by the other."
+    )
+
+    # ------------------------------------------------------------
+    # 7. POLLUTANT LOADING
+    # ------------------------------------------------------------
+    st.header("7. Traffic-Based Pollutant Loading")
+
+    st.write(
+        "Traffic data can be converted into a pollutant mass time series "
+        "using user-defined emission factors and road characteristics. "
+        "The calculation is transparent so that the assumptions can be "
+        "reviewed and changed."
+    )
+
+    st.markdown(
+        """
+        For a generic traffic dataset, the conceptual calculation is:
+
+        **Traffic volume × emission factor × road length × correction factors**
+        """
+    )
+
+    st.latex(
+        r"M_{\mathrm{pollutant}}="
+        r"\frac{N_{\mathrm{vehicles}}\;EF\;L\;K}{10^6}"
+    )
+
+    st.caption(
+        "The exact units and correction factors depend on the selected "
+        "calculation setup. The application displays the active parameters "
+        "in the Pollutant Loading module."
+    )
+
+    # ------------------------------------------------------------
+    # 8. VEHICLE-CLASS METHOD
+    # ------------------------------------------------------------
+    st.header("8. Vehicle-Class Emission Method")
+
+    st.write(
+        "If the traffic dataset contains separate vehicle classes, "
+        "class-specific emission factors can be applied."
+    )
+
+    st.markdown(
+        """
+        The implemented NIQKI vehicle-class workflow supports categories such as:
+
+        - Passenger cars / light commercial vehicles
+        - Heavy goods vehicles
+        - Buses
+
+        The corresponding emission factors are user-configurable in the
+        Pollutant Loading module.
+        """
+    )
+
+    st.latex(
+        r"M_{\mathrm{TWP}}="
+        r"\frac{\sum_j N_j\,EF_j\,L\,K_{\mathrm{drive}}\,K_{\mathrm{road}}}"
+        r"{10^6}"
+    )
+
+    st.caption(
+        "This formulation is applicable when the uploaded traffic dataset "
+        "contains the corresponding vehicle-class counts."
+    )
+
+    # ------------------------------------------------------------
+    # 9. BUILDUP / WASH-OFF
+    # ------------------------------------------------------------
+    st.header("9. Pollutant Buildup and Wash-off")
+
+    st.write(
+        "The pollutant-loading workflow represents the accumulation of "
+        "traffic-derived pollutant mass on the contributing road surface "
+        "and its subsequent removal during rainfall."
+    )
+
+    st.markdown(
+        """
+        The implemented daily buildup/wash-off workflow includes:
+
+        - Pollutant generation
+        - Dry-period buildup
+        - Rainfall-driven wash-off
+        - Verge retention
+        - Gully/trap retention
+        - Resulting mass transferred to the sewer system
+        """
+    )
+
+    st.latex(
+        r"B_{\mathrm{before}}="
+        r"B_{\mathrm{previous}}e^{-k_{\mathrm{loss}}\Delta t}"
+        r"+\frac{M_{\mathrm{gen}}}{k_{\mathrm{loss}}}"
+        r"\left(1-e^{-k_{\mathrm{loss}}\Delta t}\right)"
+    )
+
+    st.latex(
+        r"M_{\mathrm{washed}}="
+        r"\min\left(C_1 q^{C_2}B_{\mathrm{before}}\Delta t,"
+        r"B_{\mathrm{before}}\right)"
+    )
+
+    st.latex(
+        r"M_{\mathrm{sewer}}="
+        r"M_{\mathrm{washed}}(1-\eta_{\mathrm{verge}})"
+        r"(1-\eta_{\mathrm{trap}})"
+    )
+
+    st.caption(
+        "The active parameter values are displayed in the Pollutant Loading "
+        "module when the calculation is performed."
+    )
+
+    # ------------------------------------------------------------
+    # 10. RUNOFF MODEL
+    # ------------------------------------------------------------
+    st.header("10. Runoff Calculation")
+
+    st.write(
+        "The simplified runoff module estimates effective rainfall and "
+        "runoff volume using the selected model parameters."
+    )
+
+    st.latex(
+        r"P_{\mathrm{effective}}="
+        r"P_{\mathrm{total}}(1-C)"
+    )
+
+    st.latex(
+        r"V_{\mathrm{runoff}}="
+        r"P_{\mathrm{effective}}\,A"
+    )
+
+    st.caption(
+        "The simplified runoff calculation is an engineering screening "
+        "calculation. It should not be interpreted as a replacement for "
+        "a full hydrodynamic SWMM simulation."
+    )
+
+    # ------------------------------------------------------------
+    # 11. SWMM PREPARATION
+    # ------------------------------------------------------------
+    st.header("11. EPA SWMM Input Preparation")
+
+    st.write(
+        "The SWMM module prepares external rainfall and pollutant input "
+        "files for connection to an EPA SWMM model."
+    )
+
+    st.markdown(
+        """
+        **Rainfall input**
+
+        The application prepares a Rain Gage external time series containing:
+
+        `Station ID · Year · Month · Day · Hour · Minute · Rainfall`
+
+        **Pollutant input**
+
+        The pollutant workflow prepares an external mass-inflow time series
+        containing:
+
+        `Date · Time · Mass Inflow (kg/day)`
+        """
+    )
+
+    st.info(
+        "The rainfall `.dat` file and pollutant-inflow `.dat` file are "
+        "different SWMM inputs. A pollutant inflow DAT is not a traffic "
+        "dataset and should not be uploaded as raw traffic data."
+    )
+
+    # ------------------------------------------------------------
+    # 12. QUALITY CONTROL
+    # ------------------------------------------------------------
+    st.header("12. Quality Control and Validation")
+
+    st.markdown(
+        """
+        Before model preparation, the application checks the consistency
+        of the uploaded data. Typical checks include:
+
+        - Date/time values are valid
+        - Time series are ordered
+        - Required columns are available
+        - Rainfall values are non-negative
+        - Traffic values are valid numeric values
+        - Recording interval can be determined
+        - Rainfall and traffic periods overlap
+        - Missing values are reported
+        - Generated SWMM records follow the required structure
+        """
+    )
+
+    st.success(
+        "The application reports unresolved missing rainfall values as "
+        "a review condition rather than silently converting them to zero."
+    )
+
+    # ------------------------------------------------------------
+    # 13. ASSUMPTIONS / LIMITATIONS
+    # ------------------------------------------------------------
+    st.header("13. Assumptions and Limitations")
+
+    st.markdown(
+        """
+        **Important interpretation points**
+
+        1. The quality of the output depends on the quality and temporal
+           coverage of the uploaded source datasets.
+
+        2. Rainfall and traffic data must have a valid common analysis period
+           before combined calculations are performed.
+
+        3. Emission factors are model parameters and should be documented
+           for the selected study/application scenario.
+
+        4. Missing rainfall observations are not equivalent to zero rainfall.
+
+        5. The simplified runoff calculation is not a full hydrodynamic
+           simulation.
+
+        6. The SWMM module prepares external input files; it does not replace
+           the user's EPA SWMM model setup and independent model validation.
+
+        7. Traffic-source formats are not hard-coded as a scientific
+           requirement. Source-specific parsing is used only where the
+           structure of a dataset requires it.
+        """
+    )
+
+    # ------------------------------------------------------------
+    # 14. COMPLETE WORKFLOW
+    # ------------------------------------------------------------
+    st.header("14. Complete NIQKI Workflow")
+
+    st.markdown(
+        """
+        **Step 1 — Upload**
+
+        Rainfall and traffic datasets are imported.
+
+        **Step 2 — Validate**
+
+        File structure, timestamps, values and data quality are checked.
+
+        **Step 3 — Analyze**
+
+        Rainfall statistics, events and traffic characteristics are derived.
+
+        **Step 4 — Synchronize**
+
+        The common rainfall–traffic analysis period is established.
+
+        **Step 5 — Calculate pollutant loading**
+
+        Traffic information is converted into pollutant generation and
+        buildup/wash-off results using the selected model parameters.
+
+        **Step 6 — Model**
+
+        Runoff and pollutant results are prepared for model analysis.
+
+        **Step 7 — SWMM preparation**
+
+        External rainfall and pollutant input files are generated for
+        connection to EPA SWMM.
+        """
+    )
+
+    st.divider()
+
+    st.success(
+        "Methodology reference: use the individual application modules "
+        "to inspect the actual input data, active parameters, calculated "
+        "results and generated SWMM files."
+    )
+
 
 elif page == "Rainfall Data":
     st.title("Rainfall Data")
